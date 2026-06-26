@@ -4,7 +4,6 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-htmd = "0.5"
 kuchikiki = "0.8"
 regex = "1"
 

@@ -1,29 +1,16 @@
 //! aerc text/html filter — clean up vendor-noisy HTML, then convert to Markdown.
 //!
-//! Replaces the BeautifulSoup-based prototype. Single binary so we avoid the
-//! python interpreter startup + a separate html-to-markdown subprocess.
-//!
-//! Pipeline:
-//!   1. Parse with html5ever (via kuchikiki).
-//!   2. DOM surgery:
-//!        * normalise text nodes: drop zero-width / format chars (ZWSP, ZWJ,
-//!          ZWNJ, BOM, soft-hyphen, …) and replace NBSP-class spaces with
-//!          regular spaces. Marketing emails stuff hundreds of these into
-//!          preview-text padding; without this, link emptiness checks miss
-//!          and runs of garbage survive into the markdown.
-//!        * strip all comments (catches Outlook MSO conditionals),
-//!        * drop namespaced Outlook/Word elements (o:p, v:shape, w:WordDocument …),
-//!        * drop <head>/<style>/<script>/<iframe>/<img>/<colgroup>/<col>
-//!          plus other non-textual media (figure/picture/source/svg/canvas/
-//!          video/audio/area/map/noscript) so their wrappers can collapse,
-//!        * replace <br> with a literal newline text node,
-//!        * for every <table>, decide layout-vs-data with a small heuristic
-//!          (innermost first); flatten layout tables into <p> per row, and
-//!          drop tables whose cells are all blank regardless of heuristic.
-//!   3. Serialize cleaned DOM → htmd::HtmlToMarkdown::convert.
-//!   4. Reflow soft-wrapped paragraphs, then post-process: drop empty
-//!      markdown links, strip trailing whitespace, collapse intra-line
-//!      space runs, and collapse runs of blank lines.
+//! Single binary, pipeline:
+//!   1. Pre-process: strip non-comment IE conditionals (<![if …]>…<![endif]>)
+//!      before parsing so Outlook bullet spans don't leak into the DOM.
+//!   2. Parse with html5ever (via kuchikiki).
+//!   3. DOM surgery: strip comments (catches <!--[if mso]> Outlook blocks),
+//!      drop namespaced/non-text/hidden elements, normalise text nodes, split
+//!      <p>/<div> at <br>, flatten layout tables, demote stat headings, collapse
+//!      flex rows, drop decorative/empty anchors.
+//!   4. Walk the cleaned DOM with a custom serialiser → Markdown (no htmd, no
+//!      regex post-processing).
+//!   5. Hard-wrap lines, collapse blank runs.
 use std::error::Error;
 use std::io::{self, Read, Write};
 use std::sync::OnceLock;
@@ -36,6 +23,12 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut input = String::new();
     io::stdin().read_to_string(&mut input)?;
 
+    // Strip non-comment IE conditionals before parsing so Outlook bullet
+    // spans (<![if !supportLists]><span>·</span><![endif]>) and other
+    // Outlook-only blocks don't appear in the DOM as regular text nodes.
+    // Standard <!--[if mso]>…<![endif]--> comment-form conditionals are
+    // already handled by html5ever's bogus-comment parser + strip_comments.
+    let input = strip_ie_conditionals(&input);
     let doc = parse_html().one(input);
 
     strip_comments(&doc);
@@ -44,6 +37,22 @@ fn main() -> Result<(), Box<dyn Error>> {
     // doesn't populate `prefix` for non-XHTML input. Match on either.
     drop_elements(&doc, |el| {
         el.name.prefix.is_some() || el.name.local.contains(':')
+    });
+    // Responsive emails duplicate content: one version visible on desktop,
+    // one on mobile, toggled via CSS. Since we strip stylesheets, both
+    // render. Drop any element whose inline style hides it.
+    drop_elements(&doc, |el| {
+        el.attributes
+            .borrow()
+            .get("style")
+            .map(|s| {
+                let s = s.to_ascii_lowercase();
+                s.contains("display:none")
+                    || s.contains("display: none")
+                    || s.contains("visibility:hidden")
+                    || s.contains("visibility: hidden")
+            })
+            .unwrap_or(false)
     });
     drop_elements(&doc, |el| {
         matches!(
@@ -70,42 +79,17 @@ fn main() -> Result<(), Box<dyn Error>> {
     // Must run before drop_empty_anchors so anchors padded with ZWSPs etc.
     // become text-empty.
     normalise_text_nodes(&doc);
-    replace_brs(&doc);
+    split_paragraphs_at_brs(&doc);
     flatten_link_text(&doc);
     unwrap_punctuation_emphasis(&doc);
     demote_stat_headings(&doc);
     inline_flex_row_divs(&doc);
     flatten_tables(&doc);
     // Marketing emails wrap a brand logo in <a href="…"><img></a>; once we
-    // drop the <img>, the anchor has no visible text and htmd renders it as
-    // `[](url)`. Strip those empty anchors.
+    // drop the <img>, the anchor has no visible text. Strip those empty anchors.
     drop_empty_anchors(&doc);
 
-    let mut html_buf = Vec::new();
-    doc.serialize(&mut html_buf)?;
-    let cleaned_html = String::from_utf8(html_buf)?;
-
-    let md = htmd::HtmlToMarkdown::builder()
-        .options(htmd::options::Options {
-            bullet_list_marker: htmd::options::BulletListMarker::Dash,
-            ul_bullet_spacing: 1,
-            ol_number_spacing: 1,
-            ..Default::default()
-        })
-        .build()
-        .convert(&cleaned_html)?;
-    let md = reflow_paragraphs(&md);
-    let md = collapse_redundant_links(&md);
-    let md = drop_empty_md_links(&md);
-    let md = strip_empty_table_lines(&md);
-    let md = trim_trailing_ws(&md);
-    let md = collapse_intra_line_spaces(&md);
-    let md = drop_empty_headings(&md);
-    let md = normalise_heading_levels(&md);
-    let md = wrap_lines(&md, wrap_width());
-    let md = unescape_safe(&md);
-    let md = collapse_blank_runs(&md);
-    let md = normalize_tables(&md);
+    let md = to_markdown(&doc, wrap_width());
     let md = md.trim_start_matches('\n').to_string();
 
     io::stdout().write_all(md.as_bytes())?;
@@ -202,10 +186,19 @@ fn drop_empty_anchors(root: &NodeRef) {
         .filter(|n| local_name_is(n, "a"))
         .collect();
     for a in anchors {
-        if subtree_text(&a).trim().is_empty() {
+        let text = subtree_text(&a);
+        let trimmed = text.trim();
+        if trimmed.is_empty() || is_decorative_glyph(trimmed) {
             a.detach();
         }
     }
+}
+
+/// Single non-alphanumeric character links (›, », →, ▸, etc.) are decorative
+/// icon links that add noise in a text/terminal reader.
+fn is_decorative_glyph(s: &str) -> bool {
+    let mut chars = s.chars();
+    matches!((chars.next(), chars.next()), (Some(c), None) if !c.is_alphanumeric())
 }
 
 fn subtree_text(n: &NodeRef) -> String {
@@ -469,14 +462,132 @@ fn flatten_link_text(root: &NodeRef) {
     }
 }
 
-fn replace_brs(root: &NodeRef) {
+/// For `<br>` inside a `<p>`, bubble the `<br>` up to be a direct child of the
+/// `<p>`, then split the `<p>` into two at that point. This preserves intended
+/// line breaks (forwarded email headers, address blocks) instead of letting
+/// reflow logic join everything back into one line. `<br>` anywhere else
+/// becomes a literal `\n` text node as before.
+fn split_paragraphs_at_brs(root: &NodeRef) {
     let brs: Vec<NodeRef> = root
         .inclusive_descendants()
         .filter(|n| local_name_is(n, "br"))
         .collect();
     for br in brs {
-        br.insert_before(NodeRef::new_text("\n"));
+        if br.parent().is_none() {
+            continue;
+        }
+        let block = match nearest_block_ancestor(&br) {
+            Some(b) => b,
+            None => {
+                br.insert_before(NodeRef::new_text("\n"));
+                br.detach();
+                continue;
+            }
+        };
+        // Split <p> and <div>; both are block containers where <br> represents
+        // an intentional line break. Skip <td>, <li>, etc. and skip when an
+        // <a> sits in the path (splitting would move children outside the link).
+        let splittable = local_name_is(&block, "p") || local_name_is(&block, "div");
+        if !splittable || has_anchor_ancestor_before_block(&br, &block) {
+            br.insert_before(NodeRef::new_text("\n"));
+            br.detach();
+            continue;
+        }
+        let p = block;
+        // Bubble <br> up to be a direct child of <p>, one level at a time.
+        while br.parent().is_some() && br.parent().as_ref() != Some(&p) {
+            let parent = br.parent().unwrap();
+            let after = collect_following_siblings(&br);
+            br.detach();
+            insert_after(&parent, br.clone());
+            let mut prev = br.clone();
+            for s in after {
+                s.detach();
+                insert_after(&prev, s.clone());
+                prev = s;
+            }
+        }
+        // Split <p> at <br>: move everything after <br> into a fresh <p>.
+        let after = collect_following_siblings(&br);
+        if !after.is_empty() {
+            let new_p = make_paragraph();
+            for s in after {
+                s.detach();
+                new_p.append(s);
+            }
+            insert_after(&p, new_p);
+        }
         br.detach();
+    }
+}
+
+fn nearest_block_ancestor(n: &NodeRef) -> Option<NodeRef> {
+    let mut p = n.parent();
+    while let Some(parent) = p {
+        if parent
+            .as_element()
+            .map(|el| {
+                matches!(
+                    &*el.name.local,
+                    "p" | "div"
+                        | "td"
+                        | "th"
+                        | "li"
+                        | "blockquote"
+                        | "pre"
+                        | "h1"
+                        | "h2"
+                        | "h3"
+                        | "h4"
+                        | "h5"
+                        | "h6"
+                        | "table"
+                        | "tbody"
+                        | "thead"
+                        | "tfoot"
+                        | "tr"
+                        | "ul"
+                        | "ol"
+                )
+            })
+            .unwrap_or(false)
+        {
+            return Some(parent);
+        }
+        p = parent.parent();
+    }
+    None
+}
+
+fn has_anchor_ancestor_before_block(n: &NodeRef, block: &NodeRef) -> bool {
+    let mut p = n.parent();
+    while let Some(parent) = p {
+        if parent == *block {
+            return false;
+        }
+        if local_name_is(&parent, "a") {
+            return true;
+        }
+        p = parent.parent();
+    }
+    false
+}
+
+fn collect_following_siblings(n: &NodeRef) -> Vec<NodeRef> {
+    let mut v = Vec::new();
+    let mut cur = n.next_sibling();
+    while let Some(sib) = cur {
+        cur = sib.next_sibling();
+        v.push(sib);
+    }
+    v
+}
+
+fn insert_after(node: &NodeRef, new_node: NodeRef) {
+    if let Some(next) = node.next_sibling() {
+        next.insert_before(new_node);
+    } else if let Some(parent) = node.parent() {
+        parent.append(new_node);
     }
 }
 
@@ -619,12 +730,8 @@ fn count_cells(tr: &NodeRef) -> usize {
 }
 
 fn make_paragraph() -> NodeRef {
-    // Parse a tiny fragment and steal the <p>. kuchikiki re-exports both
-    // markup5ever 0.11 and 0.12 transitively (via html5ever and htmd's
-    // html5ever 0.38), so calling NodeRef::new_element directly forces us to
-    // pick a markup5ever version that matches kuchikiki's internals. Going
-    // through the parser sidesteps the version juggling for ~free: cloning
-    // a NodeRef is just an Rc bump, and append() auto-detaches.
+    // Parse a tiny fragment rather than calling NodeRef::new_element directly
+    // to avoid coupling to kuchikiki's internal markup5ever version.
     parse_html()
         .one("<p></p>")
         .descendants()
@@ -715,9 +822,9 @@ enum CellMode {
 /// Re-thread whitespace-only text nodes from `kids` into `items` whenever
 /// they sit between two retained nodes. Filtering blanks earlier was right
 /// for cells with stray empty text padding, but inline runs need their
-/// inter-element whitespace preserved or htmd glues neighbouring text
-/// straight together (`Escalating (7)Regressed (12)`). When `items` came
-/// from a wrapper's grandchildren (classify_cell unwrapping `<p>`/`<div>`)
+/// inter-element whitespace preserved or the serialiser glues neighbouring
+/// text straight together (`Escalating (7)Regressed (12)`). When `items`
+/// came from a wrapper's grandchildren (classify_cell unwrapping `<p>`/`<div>`)
 /// it is not a subsequence of `kids`; in that case fall back to `items`
 /// untouched.
 fn include_inline_whitespace(kids: &[NodeRef], items: &[NodeRef]) -> Vec<NodeRef> {
@@ -802,8 +909,6 @@ fn is_block_kid(n: &NodeRef) -> bool {
         .unwrap_or(false)
 }
 
-/// Append `kid` to `parent`, unwrapping block-level wrappers (`<p>`, `<div>`,
-/// previously-flattened inner tables) so their inline content merges into the
 fn ends_with_whitespace(n: &NodeRef) -> bool {
     let last = match n.last_child() {
         Some(c) => c,
@@ -827,7 +932,7 @@ fn is_blank(n: &NodeRef) -> bool {
     n.as_comment().is_some()
 }
 
-// ─── Markdown post-processing ───────────────────────────────────────────────
+// ─── Markdown output helpers ─────────────────────────────────────────────────
 
 fn structural_re() -> &'static Regex {
     static R: OnceLock<Regex> = OnceLock::new();
@@ -846,97 +951,8 @@ fn blank_runs_re() -> &'static Regex {
     R.get_or_init(|| Regex::new(r"\n{3,}").unwrap())
 }
 
-fn is_structural_line(line: &str) -> bool {
-    let s = line.trim_start();
-    structural_re().is_match(s)
-        || ref_link_re().is_match(s)
-        || s.starts_with('|')
-        || line.starts_with("    ")
-}
-
-fn join_wrapped(lines: &[&str]) -> String {
-    let mut text = String::new();
-    for line in lines {
-        let stripped = line.trim();
-        if text.is_empty() {
-            text.push_str(stripped);
-        } else if text.ends_with(' ')
-            || text.ends_with('-')
-            || stripped
-                .chars()
-                .next()
-                .map(|c| matches!(c, '.' | ',' | ':' | ';' | '!' | '?' | ')' | ']'))
-                .unwrap_or(false)
-        {
-            text.push_str(stripped);
-        } else {
-            text.push(' ');
-            text.push_str(stripped);
-        }
-    }
-    text
-}
-
-/// Reflow soft-wrapped paragraphs back into single lines so the pager can do
-/// its own wrapping. Code fences, list items, blockquotes, headings, tables,
-/// reference-link definitions and indented blocks are kept verbatim.
-fn reflow_paragraphs(md: &str) -> String {
-    let mut out: Vec<String> = Vec::new();
-    let mut paragraph: Vec<&str> = Vec::new();
-    let mut in_fence = false;
-
-    for line in md.split('\n') {
-        let starts_fence = line.starts_with("```") || line.starts_with("~~~");
-        if starts_fence {
-            if !paragraph.is_empty() {
-                out.push(join_wrapped(&paragraph));
-                paragraph.clear();
-            }
-            in_fence = !in_fence;
-            out.push(line.to_string());
-        } else if in_fence || line.trim().is_empty() || is_structural_line(line) {
-            if !paragraph.is_empty() {
-                out.push(join_wrapped(&paragraph));
-                paragraph.clear();
-            }
-            out.push(line.to_string());
-        } else {
-            paragraph.push(line);
-        }
-    }
-    if !paragraph.is_empty() {
-        out.push(join_wrapped(&paragraph));
-    }
-
-    let mut joined = out.join("\n");
-    if md.ends_with('\n') && !joined.ends_with('\n') {
-        joined.push('\n');
-    }
-    joined
-}
-
 fn collapse_blank_runs(md: &str) -> String {
     blank_runs_re().replace_all(md, "\n\n").into_owned()
-}
-
-fn heading_re() -> &'static Regex {
-    static R: OnceLock<Regex> = OnceLock::new();
-    R.get_or_init(|| Regex::new(r"^(#{1,6})(\s)").unwrap())
-}
-
-fn empty_heading_re() -> &'static Regex {
-    static R: OnceLock<Regex> = OnceLock::new();
-    R.get_or_init(|| Regex::new(r"^#{1,6}\s*$").unwrap())
-}
-
-/// Empty `<hN>` elements (commonly leftover wrappers around stripped images)
-/// serialise as bare `###`/`######` lines. Drop them so heading-level
-/// normalisation isn't skewed by phantom levels.
-fn drop_empty_headings(md: &str) -> String {
-    md.split('\n')
-        .filter(|line| !empty_heading_re().is_match(line))
-        .collect::<Vec<_>>()
-        .join("\n")
 }
 
 fn list_marker_re() -> &'static Regex {
@@ -964,71 +980,8 @@ fn wrap_width() -> usize {
     std::env::var("AERC_FILTER_WIDTH")
         .ok()
         .and_then(|s| s.parse().ok())
-        .filter(|&w: &usize| w >= 40 && w <= 240)
+        .filter(|&w: &usize| (40..=240).contains(&w))
         .unwrap_or(80)
-}
-
-/// Email HTML routinely opens with `<h2>` (the subject is the implicit
-/// `<h1>`) or skips levels (`<h1>` → `<h3>`). Renormalise so the shallowest
-/// heading becomes `#` and gaps between levels collapse — the result reads
-/// as a coherent outline regardless of the source's heading hygiene.
-fn normalise_heading_levels(md: &str) -> String {
-    let mut min_level = 7usize;
-    let mut in_fence = false;
-    for line in md.split('\n') {
-        if line.starts_with("```") || line.starts_with("~~~") {
-            in_fence = !in_fence;
-            continue;
-        }
-        if in_fence {
-            continue;
-        }
-        if let Some(c) = heading_re().captures(line) {
-            min_level = min_level.min(c[1].len());
-        }
-    }
-    if min_level > 6 {
-        return md.to_string();
-    }
-    let shift = min_level - 1;
-
-    let mut out = String::with_capacity(md.len());
-    let mut stack: Vec<(usize, usize)> = Vec::new(); // (input_level, output_level)
-    let mut in_fence = false;
-    for (i, line) in md.split('\n').enumerate() {
-        if i > 0 {
-            out.push('\n');
-        }
-        if line.starts_with("```") || line.starts_with("~~~") {
-            in_fence = !in_fence;
-            out.push_str(line);
-            continue;
-        }
-        if in_fence {
-            out.push_str(line);
-            continue;
-        }
-        if let Some(c) = heading_re().captures(line) {
-            let in_level = c[1].len() - shift;
-            while let Some(&(lvl, _)) = stack.last() {
-                if lvl >= in_level {
-                    stack.pop();
-                } else {
-                    break;
-                }
-            }
-            let out_level = stack
-                .last()
-                .map(|&(_, o)| (o + 1).min(6))
-                .unwrap_or(1);
-            stack.push((in_level, out_level));
-            out.push_str(&"#".repeat(out_level));
-            out.push_str(&line[c[1].len()..]);
-        } else {
-            out.push_str(line);
-        }
-    }
-    out
 }
 
 /// Hard-wrap paragraphs at `width` columns on word boundaries. Markdown
@@ -1135,300 +1088,440 @@ fn wrap_lines(md: &str, width: usize) -> String {
     out
 }
 
-fn empty_link_re() -> &'static Regex {
-    static R: OnceLock<Regex> = OnceLock::new();
-    R.get_or_init(|| Regex::new(r"\[ *\]\([^)]*\)").unwrap())
-}
-
-fn redundant_link_re() -> &'static Regex {
-    // `[<text>](<href>)` where href has no spaces/quotes (no title attr).
-    static R: OnceLock<Regex> = OnceLock::new();
-    R.get_or_init(|| Regex::new(r"\[([^\]\n]+)\]\(([^)\s]*)\)").unwrap())
-}
-
-/// Replace `[url](url)` with the bare `url`, and `[text]()` (empty href —
-/// htmd's output for `<a href="">text</a>`) with the bare text. Both forms
-/// are nuisance: render-markdown decorates the whole `[…](…)` once for the
-/// markdown link AND again for the autolinked URL inside the brackets, so
-/// the user sees a duplicated link icon next to a URL that wasn't really a
-/// link in the source.
-fn unescape_re() -> &'static Regex {
-    // Three top-level alternatives:
-    //   1. Inline code `` `…` `` — unescape everything inside; markdown
-    //      doesn't interpret backslashes in code spans, so `App\\Events`
-    //      surfaces double backslashes verbatim in the user's pager.
-    //   2. A whole markdown link `[text](url)` — captured so we can
-    //      rewrite text and url under different rules. Inside link TEXT
-    //      strip `\\` and `\_` only; `\[` / `\]` stay or the parser
-    //      truncates the link at the first inner `]`. Inside the URL
-    //      strip all four — htmd never emits a literal `[`/`]` there.
-    //   3. An escape sequence `\X` outside any link/code — strip all four.
-    static R: OnceLock<Regex> = OnceLock::new();
-    R.get_or_init(|| {
-        Regex::new(
-            r"(`[^`\n]+`)|(\[(?:\\.|[^\]\n])*\])\(((?:\\.|[^)\n])*)\)|\\([\\_\[\]])"
-        )
-        .unwrap()
-    })
-}
-
-fn link_text_unescape_re() -> &'static Regex {
-    static R: OnceLock<Regex> = OnceLock::new();
-    R.get_or_init(|| Regex::new(r"\\([\\_])").unwrap())
-}
-
-fn link_url_unescape_re() -> &'static Regex {
-    static R: OnceLock<Regex> = OnceLock::new();
-    R.get_or_init(|| Regex::new(r"\\([\\_\[\]])").unwrap())
-}
-
-/// htmd auto-escapes `_`, `[`, `]`, `\` wherever they could conceivably
-/// trigger markdown syntax. Most are noise — `_` mid-word never opens
-/// emphasis under CommonMark flanking rules, `\\` is just a backslash,
-/// and `[…]` only matters when followed by `(…)`. Outside links we strip
-/// all four. Inside link text we keep `\[` / `\]` (the parser would
-/// otherwise truncate the link and render raw `[…](url)`); inside the
-/// URL we strip everything because htmd never emits a real `[`/`]` there.
-fn unescape_safe(md: &str) -> String {
-    unescape_re()
-        .replace_all(md, |caps: &regex::Captures| {
-            if let Some(code) = caps.get(1) {
-                // Branch 1: inline code span — unescape all four inside.
-                let raw = code.as_str();
-                let inner = &raw[1..raw.len() - 1];
-                let cleaned = link_url_unescape_re().replace_all(inner, "$1");
-                format!("`{}`", cleaned)
-            } else if let Some(text_with_brackets) = caps.get(2) {
-                // Branch 2: full markdown link.
-                let text = text_with_brackets.as_str();
-                let url = caps.get(3).map(|m| m.as_str()).unwrap_or("");
-                let inner = &text[1..text.len() - 1];
-                let new_text = link_text_unescape_re().replace_all(inner, "$1");
-                let new_url = link_url_unescape_re().replace_all(url, "$1");
-                format!("[{}]({})", new_text, new_url)
-            } else if let Some(esc) = caps.get(4) {
-                // Branch 3: bare escape — strip.
-                esc.as_str().to_string()
-            } else {
-                caps[0].to_string()
-            }
-        })
-        .into_owned()
-}
-
-fn collapse_redundant_links(md: &str) -> String {
-    redundant_link_re()
-        .replace_all(md, |caps: &regex::Captures| {
-            let text = &caps[1];
-            let href = &caps[2];
-            if href.is_empty() {
-                return text.to_string();
-            }
-            if text.trim_end_matches('/') == href.trim_end_matches('/') {
-                return text.to_string();
-            }
-            caps[0].to_string()
-        })
-        .into_owned()
-}
-
-fn intra_space_re() -> &'static Regex {
-    static R: OnceLock<Regex> = OnceLock::new();
-    R.get_or_init(|| Regex::new(r"  +").unwrap())
-}
-
-fn empty_table_line_re() -> &'static Regex {
-    // An "empty" table row is pipes + whitespace only — a leftover scaffold
-    // from a layout table whose cells all collapsed to blank. The header
-    // separator `|---|---|` (and aligned variants like `|:--|:--:|--:|`)
-    // contains dashes / colons and must NOT be stripped, otherwise data
-    // tables lose their separator and the renderer falls back to pipe text.
-    static R: OnceLock<Regex> = OnceLock::new();
-    R.get_or_init(|| Regex::new(r"^[ \t|]+$").unwrap())
-}
-
-/// Drop residual `[](url)` and `[ ](url)` left after image stripping. htmd
-/// has already serialised them by this point so DOM-level scrubbing can
-/// miss cases where the empty text only became visible after htmd's own
-/// inline-element collapsing.
-fn drop_empty_md_links(md: &str) -> String {
-    empty_link_re().replace_all(md, "").into_owned()
-}
-
-/// Markdown lines that contain only `|`, `-`, `:`, and whitespace are
-/// table scaffolding from a layout table whose cells were all blank
-/// post-cleanup. Drop them.
-fn strip_empty_table_lines(md: &str) -> String {
-    md.split('\n')
-        .filter(|line| {
-            let trimmed = line.trim();
-            if trimmed.is_empty() {
-                return true; // preserve real blank lines
-            }
-            if !trimmed.contains('|') {
-                return true;
-            }
-            !empty_table_line_re().is_match(trimmed)
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
-fn trim_trailing_ws(md: &str) -> String {
-    md.split('\n')
-        .map(str::trim_end)
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
-// ─── Table normalisation ────────────────────────────────────────────────────
-
 fn link_strip_re() -> &'static Regex {
     static R: OnceLock<Regex> = OnceLock::new();
     R.get_or_init(|| Regex::new(r"\[([^\]\n]+)\]\([^)\n]*\)").unwrap())
 }
 
-fn separator_cell_re() -> &'static Regex {
-    static R: OnceLock<Regex> = OnceLock::new();
-    R.get_or_init(|| Regex::new(r"^:?-+:?$").unwrap())
-}
-
-/// Visible width = chars the user actually sees once the pager rewrites
-/// `[text](url)` to bare `text`. Bold/italic/code markers stay (they're
-/// preserved by render-markdown), so we don't strip those.
+/// Visible width = chars the user sees once the pager rewrites `[text](url)`
+/// to bare `text`.
 fn visible_width(s: &str) -> usize {
     link_strip_re().replace_all(s.trim(), "$1").chars().count()
 }
 
-fn split_row_cells(line: &str) -> Vec<String> {
-    let trimmed = line.trim();
-    let inner = trimmed
-        .strip_prefix('|')
-        .unwrap_or(trimmed)
-        .strip_suffix('|')
-        .unwrap_or(trimmed.strip_prefix('|').unwrap_or(trimmed));
-    inner.split('|').map(|c| c.trim().to_string()).collect()
+fn ie_conditional_re() -> &'static Regex {
+    static R: OnceLock<Regex> = OnceLock::new();
+    // Non-comment IE conditionals: <![if ...]>...<![endif]>
+    // Distinct from <!--[if ...]--> comment form which html5ever handles natively.
+    // These appear in Outlook/Word HTML for list bullets, VML fallbacks, etc.
+    R.get_or_init(|| Regex::new(r"(?si)<!\[if[^\]]*\]>.*?<!\[endif\]>").unwrap())
 }
 
-fn is_separator_cells(cells: &[String]) -> bool {
-    if cells.is_empty() {
-        return false;
+fn strip_ie_conditionals(html: &str) -> String {
+    ie_conditional_re().replace_all(html, "").into_owned()
+}
+
+// ─── Markdown serialiser ─────────────────────────────────────────────────────
+
+/// Walk the cleaned DOM and emit Markdown. Replaces htmd + all regex post-
+/// processing passes. Heading levels are normalised so the shallowest heading
+/// in the document becomes `#`. Tables use visible-width column padding.
+fn to_markdown(root: &NodeRef, width: usize) -> String {
+    let shift = min_heading_level(root).saturating_sub(1);
+    let blocks = doc_blocks(root, shift);
+    let md = blocks.join("\n\n");
+    let md = collapse_blank_runs(&md);
+    wrap_lines(&md, width)
+}
+
+/// Find the shallowest heading level with non-empty text content.
+fn min_heading_level(root: &NodeRef) -> usize {
+    root.inclusive_descendants()
+        .filter_map(|n| {
+            let el = n.as_element()?;
+            let lvl = match &*el.name.local {
+                "h1" => 1usize,
+                "h2" => 2,
+                "h3" => 3,
+                "h4" => 4,
+                "h5" => 5,
+                "h6" => 6,
+                _ => return None,
+            };
+            if subtree_text(&n).trim().is_empty() {
+                return None;
+            }
+            Some(lvl)
+        })
+        .min()
+        .unwrap_or(7)
+}
+
+fn doc_blocks(root: &NodeRef, shift: usize) -> Vec<String> {
+    // Start from <body> if present, else root.
+    let start = root
+        .inclusive_descendants()
+        .find(|n| local_name_is(n, "body"))
+        .unwrap_or_else(|| root.clone());
+    node_blocks(&start, shift)
+}
+
+fn node_blocks(node: &NodeRef, shift: usize) -> Vec<String> {
+    node.children()
+        .flat_map(|c| child_to_blocks(&c, shift))
+        .collect()
+}
+
+fn has_block_child(n: &NodeRef) -> bool {
+    n.children().any(|c| {
+        c.as_element()
+            .map(|el| {
+                matches!(
+                    &*el.name.local,
+                    "p" | "div"
+                        | "h1"
+                        | "h2"
+                        | "h3"
+                        | "h4"
+                        | "h5"
+                        | "h6"
+                        | "ul"
+                        | "ol"
+                        | "hr"
+                        | "pre"
+                        | "blockquote"
+                        | "table"
+                        | "header"
+                        | "footer"
+                        | "section"
+                        | "article"
+                        | "main"
+                        | "aside"
+                        | "nav"
+                )
+            })
+            .unwrap_or(false)
+    })
+}
+
+fn heading_level_of(tag: &str) -> usize {
+    match tag {
+        "h1" => 1,
+        "h2" => 2,
+        "h3" => 3,
+        "h4" => 4,
+        "h5" => 5,
+        _ => 6,
     }
-    let mut has_dashes = false;
-    for c in cells {
-        if c.is_empty() {
+}
+
+fn child_to_blocks(node: &NodeRef, shift: usize) -> Vec<String> {
+    if let Some(t) = node.as_text() {
+        let s = t.borrow();
+        let trimmed = s.trim();
+        return if trimmed.is_empty() {
+            vec![]
+        } else {
+            vec![escape_text(trimmed)]
+        };
+    }
+
+    let el = match node.as_element() {
+        Some(e) => e,
+        None => return vec![],
+    };
+
+    match &*el.name.local {
+        "html" | "body" => node_blocks(node, shift),
+
+        "p" => {
+            let s = children_inline(node).trim().to_string();
+            if s.is_empty() {
+                vec![]
+            } else {
+                vec![s]
+            }
+        }
+
+        // Structural containers: recurse when block children present, else paragraph.
+        "div" | "header" | "footer" | "section" | "article" | "main" | "aside" | "nav"
+        | "form" | "fieldset" => {
+            if has_block_child(node) {
+                node_blocks(node, shift)
+            } else {
+                let s = children_inline(node).trim().to_string();
+                if s.is_empty() {
+                    vec![]
+                } else {
+                    vec![s]
+                }
+            }
+        }
+
+        "h1" | "h2" | "h3" | "h4" | "h5" | "h6" => {
+            let lvl = heading_level_of(&el.name.local)
+                .saturating_sub(shift)
+                .max(1)
+                .min(6);
+            let s = children_inline(node).trim().to_string();
+            if s.is_empty() {
+                return vec![];
+            }
+            vec![format!("{} {}", "#".repeat(lvl), s)]
+        }
+
+        "hr" => vec!["---".to_string()],
+
+        "pre" => {
+            let text = subtree_text(node);
+            let trimmed = text.trim_end();
+            if trimmed.is_empty() {
+                return vec![];
+            }
+            vec![format!("```\n{}\n```", trimmed)]
+        }
+
+        "blockquote" => {
+            let inner = node_blocks(node, shift);
+            if inner.is_empty() {
+                return vec![];
+            }
+            let joined = inner.join("\n\n");
+            let quoted = joined
+                .lines()
+                .map(|l| {
+                    if l.is_empty() {
+                        ">".to_string()
+                    } else {
+                        format!("> {}", l)
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            vec![quoted]
+        }
+
+        "ul" => {
+            let s = serialize_list(node, false, 0, shift);
+            if s.is_empty() {
+                vec![]
+            } else {
+                vec![s]
+            }
+        }
+        "ol" => {
+            let s = serialize_list(node, true, 0, shift);
+            if s.is_empty() {
+                vec![]
+            } else {
+                vec![s]
+            }
+        }
+
+        "table" => {
+            let s = serialize_table(node);
+            if s.is_empty() {
+                vec![]
+            } else {
+                vec![s]
+            }
+        }
+
+        // Inline element at block level: treat as paragraph.
+        _ => {
+            let s = node_inline(node).trim().to_string();
+            if s.is_empty() {
+                vec![]
+            } else {
+                vec![s]
+            }
+        }
+    }
+}
+
+// ─── Inline serialisation ────────────────────────────────────────────────────
+
+fn node_inline(node: &NodeRef) -> String {
+    if let Some(t) = node.as_text() {
+        return escape_text(&t.borrow());
+    }
+    let el = match node.as_element() {
+        Some(e) => e,
+        None => return String::new(),
+    };
+    match &*el.name.local {
+        "a" => {
+            let inner = children_inline(node).trim().to_string();
+            if inner.is_empty() || is_decorative_glyph(&inner) {
+                return String::new();
+            }
+            let href = el
+                .attributes
+                .borrow()
+                .get("href")
+                .map(str::to_owned)
+                .unwrap_or_default();
+            if href.is_empty() {
+                return inner;
+            }
+            // [url](url) → bare url
+            if inner.trim_end_matches('/') == href.trim_end_matches('/') {
+                return inner;
+            }
+            format!("[{}]({})", inner, href)
+        }
+        "strong" | "b" => {
+            let s = children_inline(node).trim().to_string();
+            if s.is_empty() {
+                return String::new();
+            }
+            format!("**{}**", s)
+        }
+        "em" | "i" => {
+            let s = children_inline(node).trim().to_string();
+            if s.is_empty() {
+                return String::new();
+            }
+            format!("*{}*", s)
+        }
+        "code" => {
+            let s = subtree_text(node);
+            let s = s.trim();
+            if s.is_empty() {
+                return String::new();
+            }
+            format!("`{}`", s)
+        }
+        // Remaining <br> after DOM surgery: collapse to space in inline context.
+        "br" => " ".to_string(),
+        _ => children_inline(node),
+    }
+}
+
+fn children_inline(node: &NodeRef) -> String {
+    node.children().map(|c| node_inline(&c)).collect()
+}
+
+/// Escape characters that could create unintended Markdown syntax. Collapses
+/// inline whitespace runs (tabs, newlines from HTML source) to a single space,
+/// matching the browser's whitespace collapsing behaviour.
+fn escape_text(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 4);
+    let mut prev_space = false;
+    for c in s.chars() {
+        if matches!(c, ' ' | '\t' | '\n' | '\r') {
+            if !prev_space {
+                out.push(' ');
+                prev_space = true;
+            }
+        } else {
+            prev_space = false;
+            match c {
+                '\\' | '`' | '*' | '_' | '[' | ']' => {
+                    out.push('\\');
+                    out.push(c);
+                }
+                _ => out.push(c),
+            }
+        }
+    }
+    out
+}
+
+// ─── List serialisation ──────────────────────────────────────────────────────
+
+fn serialize_list(list: &NodeRef, ordered: bool, depth: usize, shift: usize) -> String {
+    let indent = "  ".repeat(depth);
+    let mut items: Vec<String> = Vec::new();
+    let mut n = 1usize;
+
+    for child in list.children() {
+        if !local_name_is(&child, "li") {
             continue;
         }
-        if !separator_cell_re().is_match(c) {
-            return false;
+
+        let marker = if ordered {
+            format!("{}. ", n)
+        } else {
+            "- ".to_string()
+        };
+        n += 1;
+        // Collect inline text and any nested sub-lists from li's children.
+        let mut inline_parts: Vec<String> = Vec::new();
+        let mut sub_lists: Vec<String> = Vec::new();
+
+        for kid in child.children() {
+            if local_name_is(&kid, "ul") {
+                sub_lists.push(serialize_list(&kid, false, depth + 1, shift));
+            } else if local_name_is(&kid, "ol") {
+                sub_lists.push(serialize_list(&kid, true, depth + 1, shift));
+            } else if is_block_kid(&kid) {
+                // <p>/<div> inside li: gather as inline text
+                let s = children_inline(&kid).trim().to_string();
+                if !s.is_empty() {
+                    inline_parts.push(s);
+                }
+            } else {
+                inline_parts.push(node_inline(&kid));
+            }
         }
-        has_dashes = true;
-    }
-    has_dashes
-}
 
-fn is_separator_line(line: &str) -> bool {
-    let t = line.trim();
-    if !t.starts_with('|') {
-        return false;
-    }
-    is_separator_cells(&split_row_cells(line))
-}
-
-/// Recompute every table's separator and cell padding from visible width.
-/// htmd produces dashes proportional to the markdown source bytes, which
-/// blows up when a cell contains `[short text](very-long-url)`: the
-/// separator becomes hundreds of dashes wide while the rendered cell is
-/// only a few chars. Fix it by stripping links to their visible text and
-/// emitting `| pad |` rows where every separator dash count and cell pad
-/// count is anchored to the widest *visible* cell in the column.
-fn normalize_tables(md: &str) -> String {
-    let lines: Vec<&str> = md.split('\n').collect();
-    let mut out: Vec<String> = Vec::with_capacity(lines.len());
-    let mut i = 0;
-    while i < lines.len() {
-        let line = lines[i];
-        if line.trim_start().starts_with('|')
-            && i + 1 < lines.len()
-            && is_separator_line(lines[i + 1])
-        {
-            let start = i;
-            let mut end = i;
-            while end < lines.len() && lines[end].trim_start().starts_with('|') {
-                end += 1;
-            }
-            let block = &lines[start..end];
-            for rendered in render_table_block(block) {
-                out.push(rendered);
-            }
-            i = end;
+        let item_text = inline_parts.join("").trim().to_string();
+        if item_text.is_empty() && sub_lists.is_empty() {
             continue;
         }
-        out.push(line.to_string());
-        i += 1;
+
+        let mut item_lines = vec![format!("{}{}{}", indent, marker, item_text)];
+        for sub in sub_lists {
+            // Sub-list already carries its own depth-based indent.
+            for line in sub.lines() {
+                item_lines.push(line.to_string());
+            }
+        }
+        items.push(item_lines.join("\n"));
     }
-    out.join("\n")
+
+    items.join("\n")
 }
 
-fn render_table_block(rows: &[&str]) -> Vec<String> {
-    let mut parsed: Vec<Vec<String>> = rows.iter().map(|r| split_row_cells(r)).collect();
-    let mut ncols = parsed.iter().map(|r| r.len()).max().unwrap_or(0);
-    if ncols == 0 {
-        return rows.iter().map(|s| s.to_string()).collect();
+// ─── Table serialisation ─────────────────────────────────────────────────────
+
+fn serialize_table(table: &NodeRef) -> String {
+    let rows = collect_rows(table);
+    if rows.len() < 2 {
+        return String::new();
     }
 
-    let sep_idx_initial = parsed
+    // Serialise every cell to inline Markdown.
+    let mut parsed: Vec<Vec<String>> = rows
         .iter()
-        .enumerate()
-        .skip(1)
-        .find(|(_, r)| is_separator_cells(r))
-        .map(|(i, _)| i);
+        .map(|tr| {
+            tr.children()
+                .filter(|n| local_name_is(n, "td") || local_name_is(n, "th"))
+                .map(|cell| children_inline(&cell).trim().to_string())
+                .collect()
+        })
+        .collect();
 
-    // Drop columns whose every non-separator cell is empty. Sentry's weekly
-    // digest puts a 1×1 colour swatch (`<span>&nbsp;</span>`) in a leading
-    // `<th></th>`/`<td>` column purely for visual decoration; after NBSP
-    // normalisation those cells are blank and the rendered table starts with
-    // a useless `| |` column.
+    let ncols = parsed.iter().map(|r| r.len()).max().unwrap_or(0);
+    if ncols == 0 {
+        return String::new();
+    }
+
+    // Drop columns where every cell is empty.
     let keep: Vec<usize> = (0..ncols)
         .filter(|&c| {
-            parsed.iter().enumerate().any(|(i, row)| {
-                if Some(i) == sep_idx_initial {
-                    return false;
-                }
-                row.get(c).map(|s| !s.trim().is_empty()).unwrap_or(false)
-            })
+            parsed
+                .iter()
+                .any(|row| row.get(c).map(|s| !s.trim().is_empty()).unwrap_or(false))
         })
         .collect();
     if keep.len() < ncols && !keep.is_empty() {
-        for row in parsed.iter_mut() {
-            *row = keep.iter().map(|&c| row.get(c).cloned().unwrap_or_default()).collect();
+        for row in &mut parsed {
+            *row = keep
+                .iter()
+                .map(|&c| row.get(c).cloned().unwrap_or_default())
+                .collect();
         }
-        ncols = keep.len();
     }
-    let sep_idx = parsed
-        .iter()
-        .enumerate()
-        .skip(1)
-        .find(|(_, r)| is_separator_cells(r))
-        .map(|(i, _)| i);
+    let ncols = parsed.first().map(|r| r.len()).unwrap_or(0);
+    if ncols == 0 {
+        return String::new();
+    }
 
-    // Capture alignment from the separator (`:--` left, `--:` right, `:-:` center).
-    let alignments: Vec<(bool, bool)> = if let Some(si) = sep_idx {
-        (0..ncols)
-            .map(|c| {
-                let cell = parsed[si].get(c).cloned().unwrap_or_default();
-                (cell.starts_with(':'), cell.ends_with(':'))
-            })
-            .collect()
-    } else {
-        vec![(false, false); ncols]
-    };
-
+    // Compute column widths from visible text (strips link syntax).
     let mut widths = vec![3usize; ncols];
-    for (i, row) in parsed.iter().enumerate() {
-        if Some(i) == sep_idx {
-            continue;
-        }
+    for row in &parsed {
         for (c, cell) in row.iter().enumerate() {
             let w = visible_width(cell);
             if w > widths[c] {
@@ -1437,64 +1530,31 @@ fn render_table_block(rows: &[&str]) -> Vec<String> {
         }
     }
 
-    let mut out = Vec::with_capacity(parsed.len());
+    // Emit: row 0 is always the header, separator follows, then data rows.
+    let mut lines: Vec<String> = Vec::new();
     for (i, row) in parsed.iter().enumerate() {
         let mut line = String::from("|");
         for c in 0..ncols {
-            let raw = row.get(c).cloned().unwrap_or_default();
-            let w = widths[c];
-            if Some(i) == sep_idx {
-                let (l, r) = alignments[c];
-                let body = match (l, r) {
-                    (true, true) => format!(":{}:", "-".repeat(w.saturating_sub(2).max(1))),
-                    (true, false) => format!(":{}", "-".repeat(w.saturating_sub(1).max(1))),
-                    (false, true) => format!("{}:", "-".repeat(w.saturating_sub(1).max(1))),
-                    (false, false) => "-".repeat(w),
-                };
-                line.push(' ');
-                line.push_str(&body);
-                line.push_str(" |");
-            } else {
-                let visible = visible_width(&raw);
-                let pad = w.saturating_sub(visible);
-                line.push(' ');
-                line.push_str(&raw);
-                if pad > 0 {
-                    line.push_str(&" ".repeat(pad));
-                }
-                line.push_str(" |");
+            let cell = row.get(c).map(|s| s.as_str()).unwrap_or("");
+            let vis = visible_width(cell);
+            let pad = widths[c].saturating_sub(vis);
+            line.push(' ');
+            line.push_str(cell);
+            if pad > 0 {
+                line.push_str(&" ".repeat(pad));
             }
+            line.push_str(" |");
         }
-        out.push(line);
+        lines.push(line);
+        if i == 0 {
+            let mut sep = String::from("|");
+            for &w in &widths {
+                sep.push(' ');
+                sep.push_str(&"-".repeat(w));
+                sep.push_str(" |");
+            }
+            lines.push(sep);
+        }
     }
-    out
-}
-
-/// Collapse runs of 2+ spaces to a single space, but leave 4-space-indented
-/// code blocks and table cells (`|` separators are already handled) alone.
-fn collapse_intra_line_spaces(md: &str) -> String {
-    let mut out = String::with_capacity(md.len());
-    let mut in_fence = false;
-    for (i, line) in md.split('\n').enumerate() {
-        if i > 0 {
-            out.push('\n');
-        }
-        let starts_fence = line.starts_with("```") || line.starts_with("~~~");
-        if starts_fence {
-            in_fence = !in_fence;
-            out.push_str(line);
-            continue;
-        }
-        if in_fence || line.starts_with("    ") || line.starts_with('\t') {
-            out.push_str(line);
-            continue;
-        }
-        // Preserve leading indentation (list continuation, blockquote prefix)
-        // by only collapsing runs after the first non-space character.
-        let leading: String = line.chars().take_while(|c| *c == ' ').collect();
-        let body = &line[leading.len()..];
-        out.push_str(&leading);
-        out.push_str(&intra_space_re().replace_all(body, " "));
-    }
-    out
+    lines.join("\n")
 }
