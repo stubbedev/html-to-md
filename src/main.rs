@@ -1376,16 +1376,24 @@ fn node_inline(node: &NodeRef) -> String {
 /// strip surrounding whitespace on every line so leading spaces from source
 /// text nodes (`...<br>\n  Diff: ...`) don't survive as ragged indentation,
 /// while preserving blank lines (from `<br><br>`) between the kept lines.
+/// A block that reduces to a single ASCII punctuation char is dropped: it is
+/// separator residue, e.g. the ` . ` left between two `<img>` that were removed
+/// as decorative media.
 fn tidy_inline_block(s: &str) -> String {
-    if !s.contains('\n') {
-        return s.trim().to_string();
+    let out = if !s.contains('\n') {
+        s.trim().to_string()
+    } else {
+        s.lines()
+            .map(|l| l.trim())
+            .collect::<Vec<_>>()
+            .join("\n")
+            .trim()
+            .to_string()
+    };
+    if out.len() == 1 && out.as_bytes()[0].is_ascii_punctuation() {
+        return String::new();
     }
-    s.lines()
-        .map(|l| l.trim())
-        .collect::<Vec<_>>()
-        .join("\n")
-        .trim()
-        .to_string()
+    out
 }
 
 fn children_inline(node: &NodeRef) -> String {
