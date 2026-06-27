@@ -692,10 +692,47 @@ fn flatten_one_table(table: &NodeRef) {
         }
     }
 
+    // If every flattened row is a short, single-line inline paragraph, this is a
+    // key-value / price-summary / spec table (`Subtotal | 1.780,00 kr`). Join the
+    // rows tight with `<br>` so they render as a compact block instead of a stack
+    // of blank-line-separated one-liners. Any long or block-bearing row leaves the
+    // whole table untouched, so marketing layout tables are never crammed.
+    if emitted.len() >= 2 && emitted.iter().all(is_short_inline_paragraph) {
+        let group = make_paragraph();
+        for (i, n) in emitted.iter().enumerate() {
+            if i > 0 {
+                group.append(make_br());
+            }
+            for child in n.children().collect::<Vec<_>>() {
+                child.detach();
+                group.append(child);
+            }
+        }
+        emitted = vec![group];
+    }
+
     for n in emitted {
         table.insert_before(n);
     }
     table.detach();
+}
+
+/// A `<p>` holding a short single line of inline content (no block descendant,
+/// no `<br>`): one row of a key-value / spec table.
+fn is_short_inline_paragraph(n: &NodeRef) -> bool {
+    if !local_name_is(n, "p") || subtree_has_block(n) || subtree_has_br(n) {
+        return false;
+    }
+    let len = subtree_text(n).trim().chars().count();
+    len > 0 && len <= 60
+}
+
+fn make_br() -> NodeRef {
+    parse_html()
+        .one("<br>")
+        .descendants()
+        .find(|n| local_name_is(n, "br"))
+        .expect("kuchikiki always materialises the parsed <br>")
 }
 
 enum CellMode {
