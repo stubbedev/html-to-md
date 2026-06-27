@@ -879,7 +879,13 @@ fn classify_cell(non_blank: &[NodeRef]) -> CellMode {
             .map(|el| matches!(&*el.name.local, "p" | "div"))
             .unwrap_or(false);
         if is_wrapper {
-            return CellMode::Inline(only.children().collect());
+            let grandkids: Vec<NodeRef> = only.children().collect();
+            let gk_non_blank: Vec<NodeRef> =
+                grandkids.iter().filter(|n| !is_blank(n)).cloned().collect();
+            if gk_non_blank.iter().all(|k| !is_block_kid(k)) {
+                return CellMode::Inline(grandkids);
+            }
+            return CellMode::Blocks(gk_non_blank);
         }
     }
     CellMode::Blocks(non_blank.to_vec())
@@ -1163,35 +1169,23 @@ fn node_blocks(node: &NodeRef, shift: usize) -> Vec<String> {
 }
 
 fn has_block_child(n: &NodeRef) -> bool {
-    n.children().any(|c| {
-        c.as_element()
-            .map(|el| {
-                matches!(
-                    &*el.name.local,
-                    "p" | "div"
-                        | "h1"
-                        | "h2"
-                        | "h3"
-                        | "h4"
-                        | "h5"
-                        | "h6"
-                        | "ul"
-                        | "ol"
-                        | "hr"
-                        | "pre"
-                        | "blockquote"
-                        | "table"
-                        | "header"
-                        | "footer"
-                        | "section"
-                        | "article"
-                        | "main"
-                        | "aside"
-                        | "nav"
-                )
-            })
-            .unwrap_or(false)
-    })
+    n.children()
+        .any(|c| c.as_element().map(|el| is_block_name(&el.name.local)).unwrap_or(false))
+}
+
+fn is_block_name(name: &str) -> bool {
+    matches!(
+        name,
+        "p" | "div" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6"
+            | "ul" | "ol" | "hr" | "pre" | "blockquote" | "table"
+            | "header" | "footer" | "section" | "article" | "main"
+            | "aside" | "nav" | "center"
+    )
+}
+
+fn subtree_has_block(n: &NodeRef) -> bool {
+    n.descendants()
+        .any(|c| c.as_element().map(|el| is_block_name(&el.name.local)).unwrap_or(false))
 }
 
 fn heading_level_of(tag: &str) -> usize {
@@ -1224,18 +1218,9 @@ fn child_to_blocks(node: &NodeRef, shift: usize) -> Vec<String> {
     match &*el.name.local {
         "html" | "body" => node_blocks(node, shift),
 
-        "p" => {
-            let s = children_inline(node).trim().to_string();
-            if s.is_empty() {
-                vec![]
-            } else {
-                vec![s]
-            }
-        }
-
-        // Structural containers: recurse when block children present, else paragraph.
-        "div" | "header" | "footer" | "section" | "article" | "main" | "aside" | "nav"
-        | "form" | "fieldset" => {
+        // Structural containers (and <p>): recurse when block children present, else paragraph.
+        "p" | "div" | "center" | "header" | "footer" | "section" | "article" | "main"
+        | "aside" | "nav" | "form" | "fieldset" => {
             if has_block_child(node) {
                 node_blocks(node, shift)
             } else {
@@ -1317,13 +1302,19 @@ fn child_to_blocks(node: &NodeRef, shift: usize) -> Vec<String> {
             }
         }
 
-        // Inline element at block level: treat as paragraph.
+        // Unknown/inline element at block level: recurse if any descendant is
+        // a block element (handles schema.org/microdata spans that wrap the
+        // entire email layout), otherwise treat as inline paragraph.
         _ => {
-            let s = node_inline(node).trim().to_string();
-            if s.is_empty() {
-                vec![]
+            if subtree_has_block(node) {
+                node_blocks(node, shift)
             } else {
-                vec![s]
+                let s = node_inline(node).trim().to_string();
+                if s.is_empty() {
+                    vec![]
+                } else {
+                    vec![s]
+                }
             }
         }
     }
@@ -1358,21 +1349,38 @@ fn node_inline(node: &NodeRef) -> String {
             if inner.trim_end_matches('/') == href.trim_end_matches('/') {
                 return inner;
             }
-            format!("[{}]({})", inner, href)
+            // If inner already contains markdown link syntax, use plain text
+            // to avoid nested [[...](url)](url) which breaks parsers.
+            let display = if inner.contains("](") {
+                subtree_text(node)
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            } else {
+                inner
+            };
+            if display.is_empty() {
+                return String::new();
+            }
+            format!("[{}]({})", display, href)
         }
         "strong" | "b" => {
-            let s = children_inline(node).trim().to_string();
+            let inner = children_inline(node);
+            let s = inner.trim();
             if s.is_empty() {
                 return String::new();
             }
-            format!("**{}**", s)
+            let trail = if inner.ends_with(|c: char| c.is_whitespace()) { " " } else { "" };
+            format!("**{}**{}", s, trail)
         }
         "em" | "i" => {
-            let s = children_inline(node).trim().to_string();
+            let inner = children_inline(node);
+            let s = inner.trim();
             if s.is_empty() {
                 return String::new();
             }
-            format!("*{}*", s)
+            let trail = if inner.ends_with(|c: char| c.is_whitespace()) { " " } else { "" };
+            format!("*{}*{}", s, trail)
         }
         "code" => {
             let s = subtree_text(node);
@@ -1399,7 +1407,7 @@ fn escape_text(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 4);
     let mut prev_space = false;
     for c in s.chars() {
-        if matches!(c, ' ' | '\t' | '\n' | '\r') {
+        if matches!(c, ' ' | '\t' | '\n' | '\r' | '\u{00A0}') {
             if !prev_space {
                 out.push(' ');
                 prev_space = true;
