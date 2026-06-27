@@ -1029,10 +1029,34 @@ fn strip_ie_conditionals(html: &str) -> String {
 /// in the document becomes `#`. Tables use visible-width column padding.
 fn to_markdown(root: &NodeRef, width: usize) -> String {
     let shift = min_heading_level(root).saturating_sub(1);
-    let blocks = drop_empty_sections(doc_blocks(root, shift));
+    let blocks = compress_heading_levels(drop_empty_sections(doc_blocks(root, shift)));
     let md = blocks.join("\n\n");
     let md = collapse_blank_runs(&md);
     wrap_lines(&md, width)
+}
+
+/// Remap the distinct heading levels actually present to a contiguous `1..n`
+/// range. Emails routinely jump levels — a sidebar promo marked up as `<h1>`
+/// with the real sections as `<h4>` — which `min_heading_level`'s uniform shift
+/// preserves as a jarring `#` → `####`. Rank-mapping renders that as `#` → `##`.
+fn compress_heading_levels(blocks: Vec<String>) -> Vec<String> {
+    let mut used: Vec<usize> = blocks.iter().filter_map(|b| block_heading_level(b)).collect();
+    used.sort_unstable();
+    used.dedup();
+    if used.len() < 2 {
+        return blocks;
+    }
+    blocks
+        .into_iter()
+        .map(|b| match block_heading_level(&b) {
+            Some(lvl) => {
+                let rank = used.iter().position(|&l| l == lvl).unwrap() + 1;
+                let hashes = b.chars().take_while(|&c| c == '#').count();
+                format!("{}{}", "#".repeat(rank), &b[hashes..])
+            }
+            None => b,
+        })
+        .collect()
 }
 
 /// Leading-`#` level of a block, if it is an ATX heading (`## Foo`).
