@@ -337,7 +337,10 @@ fn is_stat_text(s: &str) -> bool {
     for c in s.chars() {
         if c.is_ascii_digit() {
             saw_digit = true;
-        } else if !matches!(c, '.' | ',' | ' ' | 'k' | 'K' | 'M' | 'B' | 'm' | 's' | 'µ' | 'h') {
+        } else if !matches!(
+            c,
+            '.' | ',' | ' ' | 'k' | 'K' | 'M' | 'B' | 'm' | 's' | 'µ' | 'h'
+        ) {
             return false;
         }
     }
@@ -372,10 +375,7 @@ fn inline_flex_row_divs(root: &NodeRef) {
                 }
                 p = parent.parent();
             }
-            let direct = n
-                .children()
-                .filter(|c| c.as_element().is_some())
-                .count();
+            let direct = n.children().filter(|c| c.as_element().is_some()).count();
             (2..=MAX_FLEX_DIRECT_CHILDREN).contains(&direct)
         })
         .collect();
@@ -387,7 +387,7 @@ fn inline_flex_row_divs(root: &NodeRef) {
             }
         }
     }
-    targets.sort_by(|a, b| b.0.cmp(&a.0));
+    targets.sort_by_key(|t| std::cmp::Reverse(t.0));
 
     for (_, d) in targets {
         if d.parent().is_none() {
@@ -398,8 +398,21 @@ fn inline_flex_row_divs(root: &NodeRef) {
                 .map(|el| {
                     matches!(
                         &*el.name.local,
-                        "table" | "ul" | "ol" | "li" | "h1" | "h2" | "h3" | "h4" | "h5"
-                            | "h6" | "pre" | "blockquote" | "hr" | "p" | "div"
+                        "table"
+                            | "ul"
+                            | "ol"
+                            | "li"
+                            | "h1"
+                            | "h2"
+                            | "h3"
+                            | "h4"
+                            | "h5"
+                            | "h6"
+                            | "pre"
+                            | "blockquote"
+                            | "hr"
+                            | "p"
+                            | "div"
                     )
                 })
                 .unwrap_or(false)
@@ -461,7 +474,6 @@ fn flatten_link_text(root: &NodeRef) {
     }
 }
 
-
 fn local_name_is(n: &NodeRef, name: &str) -> bool {
     n.as_element()
         .map(|el| &*el.name.local == name)
@@ -493,7 +505,7 @@ fn flatten_tables(root: &NodeRef) {
         .filter(|n| local_name_is(n, "table"))
         .map(|n| (depth(&n), n))
         .collect();
-    tables.sort_by(|a, b| b.0.cmp(&a.0));
+    tables.sort_by_key(|t| std::cmp::Reverse(t.0));
 
     for (_, table) in tables {
         if table.parent().is_none() {
@@ -516,8 +528,9 @@ fn flatten_tables(root: &NodeRef) {
 ///   * has `<th>` anywhere, or
 ///   * has `<thead>` / `<caption>`, or
 ///   * uniform >=2-cell rows with a real `border` attribute.
-/// Explicit `role="presentation"` / `role="none"` always wins as layout,
-/// and any nested `<table>` strongly implies layout.
+///
+/// Explicit `role="presentation"` / `role="none"` always wins as layout, and any
+/// nested `<table>` strongly implies layout.
 fn is_data_table(t: &NodeRef) -> bool {
     if let Some(role) = attr(t, "role") {
         let r = role.trim().to_ascii_lowercase();
@@ -634,8 +647,7 @@ fn flatten_one_table(table: &NodeRef) {
         let mut row_p: Option<NodeRef> = None;
         for cell in cells {
             let kids: Vec<NodeRef> = cell.children().collect();
-            let non_blank: Vec<NodeRef> =
-                kids.iter().filter(|k| !is_blank(k)).cloned().collect();
+            let non_blank: Vec<NodeRef> = kids.iter().filter(|k| !is_blank(k)).cloned().collect();
             if non_blank.is_empty() {
                 continue;
             }
@@ -878,9 +890,7 @@ fn is_blank(n: &NodeRef) -> bool {
 
 fn structural_re() -> &'static Regex {
     static R: OnceLock<Regex> = OnceLock::new();
-    R.get_or_init(|| {
-        Regex::new(r"^(#{1,6}\s|[-*+]\s|\d+\.\s|>\s|[-*_]{3,}\s*$)").unwrap()
-    })
+    R.get_or_init(|| Regex::new(r"^(#{1,6}\s|[-*+]\s|\d+\.\s|>\s|[-*_]{3,}\s*$)").unwrap())
 }
 
 fn ref_link_re() -> &'static Regex {
@@ -944,10 +954,7 @@ fn wrap_lines(md: &str, width: usize) -> String {
             out.push_str(line);
             continue;
         }
-        if in_fence
-            || line.starts_with("    ")
-            || line.starts_with('\t')
-            || line.trim().is_empty()
+        if in_fence || line.starts_with("    ") || line.starts_with('\t') || line.trim().is_empty()
         {
             out.push_str(line);
             continue;
@@ -958,7 +965,10 @@ fn wrap_lines(md: &str, width: usize) -> String {
             || ref_link_re().is_match(trimmed)
             || structural_re()
                 .find(trimmed)
-                .map(|m| m.as_str().contains(['_', '*', '-']) && trimmed.chars().all(|c| matches!(c, '-' | '*' | '_' | ' ')))
+                .map(|m| {
+                    m.as_str().contains(['_', '*', '-'])
+                        && trimmed.chars().all(|c| matches!(c, '-' | '*' | '_' | ' '))
+                })
                 .unwrap_or(false)
         {
             out.push_str(line);
@@ -1120,7 +1130,10 @@ fn link_only_re() -> &'static Regex {
 /// with the real sections as `<h4>` — which `min_heading_level`'s uniform shift
 /// preserves as a jarring `#` → `####`. Rank-mapping renders that as `#` → `##`.
 fn compress_heading_levels(blocks: Vec<String>) -> Vec<String> {
-    let mut used: Vec<usize> = blocks.iter().filter_map(|b| block_heading_level(b)).collect();
+    let mut used: Vec<usize> = blocks
+        .iter()
+        .filter_map(|b| block_heading_level(b))
+        .collect();
     used.sort_unstable();
     used.dedup();
     if used.len() < 2 {
@@ -1239,23 +1252,46 @@ fn flush_inline_run(run: &mut Vec<NodeRef>, out: &mut Vec<String>) {
 }
 
 fn has_block_child(n: &NodeRef) -> bool {
-    n.children()
-        .any(|c| c.as_element().map(|el| is_block_name(&el.name.local)).unwrap_or(false))
+    n.children().any(|c| {
+        c.as_element()
+            .map(|el| is_block_name(&el.name.local))
+            .unwrap_or(false)
+    })
 }
 
 fn is_block_name(name: &str) -> bool {
     matches!(
         name,
-        "p" | "div" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6"
-            | "ul" | "ol" | "hr" | "pre" | "blockquote" | "table"
-            | "header" | "footer" | "section" | "article" | "main"
-            | "aside" | "nav" | "center"
+        "p" | "div"
+            | "h1"
+            | "h2"
+            | "h3"
+            | "h4"
+            | "h5"
+            | "h6"
+            | "ul"
+            | "ol"
+            | "hr"
+            | "pre"
+            | "blockquote"
+            | "table"
+            | "header"
+            | "footer"
+            | "section"
+            | "article"
+            | "main"
+            | "aside"
+            | "nav"
+            | "center"
     )
 }
 
 fn subtree_has_block(n: &NodeRef) -> bool {
-    n.descendants()
-        .any(|c| c.as_element().map(|el| is_block_name(&el.name.local)).unwrap_or(false))
+    n.descendants().any(|c| {
+        c.as_element()
+            .map(|el| is_block_name(&el.name.local))
+            .unwrap_or(false)
+    })
 }
 
 fn heading_level_of(tag: &str) -> usize {
@@ -1289,8 +1325,8 @@ fn child_to_blocks(node: &NodeRef, shift: usize) -> Vec<String> {
         "html" | "body" => node_blocks(node, shift),
 
         // Structural containers (and <p>): recurse when block children present, else paragraph.
-        "p" | "div" | "center" | "header" | "footer" | "section" | "article" | "main"
-        | "aside" | "nav" | "form" | "fieldset" => {
+        "p" | "div" | "center" | "header" | "footer" | "section" | "article" | "main" | "aside"
+        | "nav" | "form" | "fieldset" => {
             if has_block_child(node) {
                 node_blocks(node, shift)
             } else {
@@ -1306,8 +1342,7 @@ fn child_to_blocks(node: &NodeRef, shift: usize) -> Vec<String> {
         "h1" | "h2" | "h3" | "h4" | "h5" | "h6" => {
             let lvl = heading_level_of(&el.name.local)
                 .saturating_sub(shift)
-                .max(1)
-                .min(6);
+                .clamp(1, 6);
             // A heading is a single line; fold any `<br>`-newline to a space.
             let s = children_inline(node).replace('\n', " ").trim().to_string();
             if s.is_empty() {
@@ -1356,7 +1391,7 @@ fn child_to_blocks(node: &NodeRef, shift: usize) -> Vec<String> {
         }
 
         "ul" => {
-            let s = serialize_list(node, false, 0, shift);
+            let s = serialize_list(node, false, 0);
             if s.is_empty() {
                 vec![]
             } else {
@@ -1364,7 +1399,7 @@ fn child_to_blocks(node: &NodeRef, shift: usize) -> Vec<String> {
             }
         }
         "ol" => {
-            let s = serialize_list(node, true, 0, shift);
+            let s = serialize_list(node, true, 0);
             if s.is_empty() {
                 vec![]
             } else {
@@ -1542,8 +1577,16 @@ fn emphasis(node: &NodeRef, marker: &str) -> String {
     if s.is_empty() {
         return String::new();
     }
-    let lead = if inner.starts_with(|c: char| c.is_whitespace()) { " " } else { "" };
-    let trail = if inner.ends_with(|c: char| c.is_whitespace()) { " " } else { "" };
+    let lead = if inner.starts_with(|c: char| c.is_whitespace()) {
+        " "
+    } else {
+        ""
+    };
+    let trail = if inner.ends_with(|c: char| c.is_whitespace()) {
+        " "
+    } else {
+        ""
+    };
     format!("{lead}{marker}{s}{marker}{trail}")
 }
 
@@ -1641,7 +1684,7 @@ fn escape_text(s: &str) -> String {
 
 // ─── List serialisation ──────────────────────────────────────────────────────
 
-fn serialize_list(list: &NodeRef, ordered: bool, depth: usize, shift: usize) -> String {
+fn serialize_list(list: &NodeRef, ordered: bool, depth: usize) -> String {
     let indent = "  ".repeat(depth);
     let mut items: Vec<String> = Vec::new();
     let mut n = 1usize;
@@ -1663,9 +1706,9 @@ fn serialize_list(list: &NodeRef, ordered: bool, depth: usize, shift: usize) -> 
 
         for kid in child.children() {
             if local_name_is(&kid, "ul") {
-                sub_lists.push(serialize_list(&kid, false, depth + 1, shift));
+                sub_lists.push(serialize_list(&kid, false, depth + 1));
             } else if local_name_is(&kid, "ol") {
-                sub_lists.push(serialize_list(&kid, true, depth + 1, shift));
+                sub_lists.push(serialize_list(&kid, true, depth + 1));
             } else if is_block_kid(&kid) {
                 // <p>/<div> inside li: gather as inline text
                 let s = children_inline(&kid).trim().to_string();
@@ -1718,7 +1761,12 @@ fn serialize_table(table: &NodeRef) -> String {
                 // A `<br>`-newline inside a cell would break the table row;
                 // collapse all whitespace runs (incl. those newlines) to single
                 // spaces. Links never contain spaces, so this can't split one.
-                .map(|cell| children_inline(&cell).split_whitespace().collect::<Vec<_>>().join(" "))
+                .map(|cell| {
+                    children_inline(&cell)
+                        .split_whitespace()
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                })
                 .collect()
         })
         .collect();
@@ -1764,10 +1812,10 @@ fn serialize_table(table: &NodeRef) -> String {
     let mut lines: Vec<String> = Vec::new();
     for (i, row) in parsed.iter().enumerate() {
         let mut line = String::from("|");
-        for c in 0..ncols {
+        for (c, &width) in widths.iter().enumerate().take(ncols) {
             let cell = row.get(c).map(|s| s.as_str()).unwrap_or("");
             let vis = visible_width(cell);
-            let pad = widths[c].saturating_sub(vis);
+            let pad = width.saturating_sub(vis);
             line.push(' ');
             line.push_str(cell);
             if pad > 0 {
@@ -1796,12 +1844,18 @@ mod tests {
     #[test]
     fn decodes_literal_unicode_escapes() {
         // 4-hex, 8-hex, brace form, and a UTF-16 surrogate pair (🧠).
-        assert_eq!(decode_unicode_escapes(r"June 13 – June 20"), "June 13 – June 20");
+        assert_eq!(
+            decode_unicode_escapes(r"June 13 – June 20"),
+            "June 13 – June 20"
+        );
         assert_eq!(decode_unicode_escapes(r"\U0001f9e0 Stop"), "🧠 Stop");
         assert_eq!(decode_unicode_escapes(r"x\u{1F9E0}y"), "x🧠y");
         assert_eq!(decode_unicode_escapes(r"🧠"), "🧠");
         // Non-escapes and malformed sequences pass through untouched.
-        assert_eq!(decode_unicode_escapes(r"the \understood plan"), r"the \understood plan");
+        assert_eq!(
+            decode_unicode_escapes(r"the \understood plan"),
+            r"the \understood plan"
+        );
         assert_eq!(decode_unicode_escapes(r"\uZZZZ"), r"\uZZZZ");
         assert_eq!(decode_unicode_escapes("no escapes here"), "no escapes here");
         // Lone high surrogate is invalid → left verbatim.
