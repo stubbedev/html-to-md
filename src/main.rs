@@ -1402,10 +1402,76 @@ fn emphasis(node: &NodeRef, marker: &str) -> String {
     format!("{lead}{marker}{s}{marker}{trail}")
 }
 
+/// Decode literal unicode escape sequences that broken sender templates emit as
+/// visible text instead of the character itself: `\uXXXX` (with UTF-16 surrogate
+/// pairing), `\u{XXXX}` and `\UXXXXXXXX`. No human types these into email body
+/// copy, so a stray `–`/`\U0001f9e0` is always a templating bug — turn it
+/// back into `–`/`🧠`. Anything that isn't a well-formed escape is left verbatim.
+fn decode_unicode_escapes(s: &str) -> String {
+    if !s.contains("\\u") && !s.contains("\\U") {
+        return s.to_string();
+    }
+    let c: Vec<char> = s.chars().collect();
+    let mut out = String::with_capacity(s.len());
+    let hex = |slice: &[char]| -> Option<u32> {
+        if slice.iter().all(|h| h.is_ascii_hexdigit()) {
+            u32::from_str_radix(&slice.iter().collect::<String>(), 16).ok()
+        } else {
+            None
+        }
+    };
+    let mut i = 0;
+    while i < c.len() {
+        if c[i] == '\\' && i + 1 < c.len() && (c[i + 1] == 'u' || c[i + 1] == 'U') {
+            // `\u{...}` brace form.
+            if c[i + 1] == 'u' && i + 2 < c.len() && c[i + 2] == '{' {
+                if let Some(end) = c[i + 3..].iter().position(|&ch| ch == '}') {
+                    if let Some(cp) = hex(&c[i + 3..i + 3 + end]) {
+                        if let Some(ch) = char::from_u32(cp) {
+                            out.push(ch);
+                            i += 3 + end + 1;
+                            continue;
+                        }
+                    }
+                }
+            }
+            let width = if c[i + 1] == 'U' { 8 } else { 4 };
+            if i + 2 + width <= c.len() {
+                if let Some(cp) = hex(&c[i + 2..i + 2 + width]) {
+                    // `\uXXXX` high surrogate followed by a low surrogate → pair.
+                    if width == 4 && (0xD800..=0xDBFF).contains(&cp) {
+                        let j = i + 6;
+                        if j + 6 <= c.len() && c[j] == '\\' && c[j + 1] == 'u' {
+                            if let Some(lo) = hex(&c[j + 2..j + 6]) {
+                                if (0xDC00..=0xDFFF).contains(&lo) {
+                                    let cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
+                                    if let Some(ch) = char::from_u32(cp) {
+                                        out.push(ch);
+                                        i = j + 6;
+                                        continue;
+                                    }
+                                }
+                            }
+                        }
+                    } else if let Some(ch) = char::from_u32(cp) {
+                        out.push(ch);
+                        i += 2 + width;
+                        continue;
+                    }
+                }
+            }
+        }
+        out.push(c[i]);
+        i += 1;
+    }
+    out
+}
+
 /// Escape characters that could create unintended Markdown syntax. Collapses
 /// inline whitespace runs (tabs, newlines from HTML source) to a single space,
 /// matching the browser's whitespace collapsing behaviour.
 fn escape_text(s: &str) -> String {
+    let s = decode_unicode_escapes(s);
     let mut out = String::with_capacity(s.len() + 4);
     let mut prev_space = false;
     for c in s.chars() {
@@ -1576,4 +1642,24 @@ fn serialize_table(table: &NodeRef) -> String {
         }
     }
     lines.join("\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::decode_unicode_escapes;
+
+    #[test]
+    fn decodes_literal_unicode_escapes() {
+        // 4-hex, 8-hex, brace form, and a UTF-16 surrogate pair (🧠).
+        assert_eq!(decode_unicode_escapes(r"June 13 – June 20"), "June 13 – June 20");
+        assert_eq!(decode_unicode_escapes(r"\U0001f9e0 Stop"), "🧠 Stop");
+        assert_eq!(decode_unicode_escapes(r"x\u{1F9E0}y"), "x🧠y");
+        assert_eq!(decode_unicode_escapes(r"🧠"), "🧠");
+        // Non-escapes and malformed sequences pass through untouched.
+        assert_eq!(decode_unicode_escapes(r"the \understood plan"), r"the \understood plan");
+        assert_eq!(decode_unicode_escapes(r"\uZZZZ"), r"\uZZZZ");
+        assert_eq!(decode_unicode_escapes("no escapes here"), "no escapes here");
+        // Lone high surrogate is invalid → left verbatim.
+        assert_eq!(decode_unicode_escapes(r"\uD83E!"), r"\uD83E!");
+    }
 }
