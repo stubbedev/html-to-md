@@ -1066,10 +1066,53 @@ fn strip_ie_conditionals(html: &str) -> String {
 /// in the document becomes `#`. Tables use visible-width column padding.
 fn to_markdown(root: &NodeRef, width: usize) -> String {
     let shift = min_heading_level(root).saturating_sub(1);
-    let blocks = compress_heading_levels(drop_empty_sections(doc_blocks(root, shift)));
+    let blocks = join_link_rows(
+        compress_heading_levels(drop_empty_sections(doc_blocks(root, shift))),
+        width,
+    );
     let md = blocks.join("\n\n");
     let md = collapse_blank_runs(&md);
     wrap_lines(&md, width)
+}
+
+/// Join a run of consecutive blocks that are each a single short link into one
+/// ` · `-separated line. Vendor emails stack nav bars, framework-badge rows and
+/// footers (`[Next.js]`, `[Nuxt]`, … / `[Unsubscribe]`, `[Privacy notice]`)
+/// vertically — one block per link — which renders as a tall column of links.
+/// The short-text cap keeps article/post-title link lists (whose text is long)
+/// on their own lines, and a run is only merged when the joined line fits within
+/// `width` so it never wraps and dangles a ` ·` at a line break.
+fn join_link_rows(blocks: Vec<String>, width: usize) -> Vec<String> {
+    let is_short_link = |b: &str| {
+        let t = b.trim();
+        link_only_re().is_match(t) && visible_width(t) <= 30
+    };
+    let mut out: Vec<String> = Vec::new();
+    let mut run: Vec<String> = Vec::new();
+    let flush = |run: &mut Vec<String>, out: &mut Vec<String>| {
+        let joined = run.join(" · ");
+        if run.len() >= 2 && visible_width(&joined) <= width {
+            out.push(joined);
+        } else {
+            out.append(run);
+        }
+        run.clear();
+    };
+    for b in blocks {
+        if is_short_link(&b) {
+            run.push(b);
+        } else {
+            flush(&mut run, &mut out);
+            out.push(b);
+        }
+    }
+    flush(&mut run, &mut out);
+    out
+}
+
+fn link_only_re() -> &'static Regex {
+    static R: OnceLock<Regex> = OnceLock::new();
+    R.get_or_init(|| Regex::new(r"^\[[^\]\n]+\]\([^)\n]*\)$").unwrap())
 }
 
 /// Remap the distinct heading levels actually present to a contiguous `1..n`
