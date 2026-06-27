@@ -1066,16 +1066,22 @@ fn wrap_lines(md: &str, width: usize) -> String {
         let mut col = first_prefix.chars().count();
         let mut at_line_start = true;
         for tok in tokens {
-            let tlen = tok.chars().count();
-            // Only wrap when the next token would overflow AND a wrap is
-            // actually useful: the token can fit on a fresh line and the
-            // current line isn't already over budget. Without this, a
-            // single oversized atom (long marketing tracking URL, nested
-            // bold/italic-wrapped link) produces an N-line cascade where
-            // every short trailing word — `from`, `1 author`, punctuation
-            // — orphans onto its own line.
+            // Wrap on *visible* width: the pager rewrites `[text](url)` to bare
+            // `text`, so a token's on-screen cost is its link text, not the
+            // hundreds of raw chars a tracking URL adds. Measuring raw width
+            // here made short `[Reply] · [Like] · [date]` footers (tiny once
+            // rendered) look oversized and either explode across lines or glue a
+            // whole paragraph after a long leading link.
+            let tlen = visible_width(tok);
             let would_overflow = col + 1 + tlen > width;
-            let useless_wrap = tlen > width || col > width;
+            // Suppress the wrap only when it cannot help: the token's visible
+            // text is itself wider than the budget (a long error string or
+            // unbreakable atom), so moving it to a fresh line gains nothing. A
+            // token that *does* fit fresh always gets to wrap, even when the
+            // current line is already over budget from a preceding oversized
+            // atom — the first wrap resets `col`, so following words flow
+            // normally instead of orphaning one-per-line.
+            let useless_wrap = tlen > width;
             if !at_line_start && would_overflow && !useless_wrap {
                 out.push('\n');
                 out.push_str(&cont_prefix);
@@ -1364,24 +1370,8 @@ fn node_inline(node: &NodeRef) -> String {
             }
             format!("[{}]({})", display, href)
         }
-        "strong" | "b" => {
-            let inner = children_inline(node);
-            let s = inner.trim();
-            if s.is_empty() {
-                return String::new();
-            }
-            let trail = if inner.ends_with(|c: char| c.is_whitespace()) { " " } else { "" };
-            format!("**{}**{}", s, trail)
-        }
-        "em" | "i" => {
-            let inner = children_inline(node);
-            let s = inner.trim();
-            if s.is_empty() {
-                return String::new();
-            }
-            let trail = if inner.ends_with(|c: char| c.is_whitespace()) { " " } else { "" };
-            format!("*{}*{}", s, trail)
-        }
+        "strong" | "b" => emphasis(node, "**"),
+        "em" | "i" => emphasis(node, "*"),
         "code" => {
             let s = subtree_text(node);
             let s = s.trim();
@@ -1398,6 +1388,22 @@ fn node_inline(node: &NodeRef) -> String {
 
 fn children_inline(node: &NodeRef) -> String {
     node.children().map(|c| node_inline(&c)).collect()
+}
+
+/// Wrap inline content in an emphasis marker (`**` or `*`), keeping any leading
+/// or trailing whitespace *outside* the markers. HTML often splits a phrase
+/// across adjacent `<strong>`/`<b>` runs where the only separating space lives
+/// at a marker boundary (e.g. `<b>Twenty</b><b>&nbsp;minutes</b>`); trimming it
+/// away would fuse the words (`**Twenty****minutes**`).
+fn emphasis(node: &NodeRef, marker: &str) -> String {
+    let inner = children_inline(node);
+    let s = inner.trim();
+    if s.is_empty() {
+        return String::new();
+    }
+    let lead = if inner.starts_with(|c: char| c.is_whitespace()) { " " } else { "" };
+    let trail = if inner.ends_with(|c: char| c.is_whitespace()) { " " } else { "" };
+    format!("{lead}{marker}{s}{marker}{trail}")
 }
 
 /// Escape characters that could create unintended Markdown syntax. Collapses
