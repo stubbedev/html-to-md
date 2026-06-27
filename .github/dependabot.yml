@@ -1,0 +1,23 @@
+version: 2
+updates:
+  # Keep GitHub Actions pinned to current major/patch releases.
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: "ci"
+    groups:
+      actions:
+        patterns: ["*"]
+
+  # Keep Rust crate dependencies current.
+  - package-ecosystem: cargo
+    directory: "/"
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: "deps"
+    groups:
+      cargo:
+        patterns: ["*"]

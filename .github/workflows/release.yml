@@ -1,0 +1,119 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: build (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-amd64
+            target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+            cross: true
+          - name: linux-arm64
+            target: aarch64-unknown-linux-musl
+            os: ubuntu-latest
+            cross: true
+          - name: darwin-amd64
+            target: x86_64-apple-darwin
+            os: macos-latest
+            cross: false
+          - name: darwin-arm64
+            target: aarch64-apple-darwin
+            os: macos-latest
+            cross: false
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${{ matrix.cross }}" = "true" ]; then
+            cargo install cross --locked
+            cross build --release --locked --target ${{ matrix.target }}
+          else
+            cargo build --release --locked --target ${{ matrix.target }}
+          fi
+
+      - name: Package
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME#v}"
+          STAGE="html-to-md-${VERSION}-${{ matrix.name }}"
+          mkdir -p "dist/$STAGE"
+          cp "target/${{ matrix.target }}/release/html-to-md" "dist/$STAGE/"
+          cp README.md LICENSE "dist/$STAGE/" 2>/dev/null || true
+          cd dist
+          tar -czf "${STAGE}.tar.gz" "$STAGE"
+          shasum -a 256 "${STAGE}.tar.gz" > "${STAGE}.tar.gz.sha256"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.name }}
+          path: dist/html-to-md-*.tar.gz*
+          retention-days: 7
+
+  cache:
+    name: push nix build to attic
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: DeterminateSystems/nix-installer-action@v22
+      - uses: DeterminateSystems/magic-nix-cache-action@v14
+
+      - name: Build package
+        run: nix build .#html-to-md -L --print-out-paths | tee /tmp/outpaths
+
+      - name: Push to attic
+        continue-on-error: true
+        env:
+          ATTIC_TOKEN: ${{ secrets.ATTIC_TOKEN }}
+        run: |
+          nix run nixpkgs#attic-client -- login stubbe https://nix.stubbe.dev "$ATTIC_TOKEN"
+          for attempt in 1 2 3; do
+            if nix run nixpkgs#attic-client -- push stubbe:default $(cat /tmp/outpaths); then
+              exit 0
+            fi
+            echo "::warning::attic push attempt $attempt failed; retrying in $((attempt * 30))s"
+            sleep $((attempt * 30))
+          done
+          echo "::warning::attic push failed after 3 attempts; cache push is best-effort, continuing"
+
+  release:
+    name: publish github release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+      - run: ls -la dist/
+      - uses: softprops/action-gh-release@v3
+        with:
+          files: dist/*
+          generate_release_notes: true
+          draft: false
+          prerelease: ${{ contains(github.ref_name, '-') }}
