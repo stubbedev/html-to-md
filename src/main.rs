@@ -1096,9 +1096,42 @@ fn doc_blocks(root: &NodeRef, shift: usize) -> Vec<String> {
 }
 
 fn node_blocks(node: &NodeRef, shift: usize) -> Vec<String> {
-    node.children()
-        .flat_map(|c| child_to_blocks(&c, shift))
-        .collect()
+    // Group consecutive inline children into a single paragraph; emit block
+    // children on their own. Without this, a container that mixes inline content
+    // with a block child — `...for the account <strong>x</strong>.<ul>…</ul>` —
+    // scatters each text run, `<strong>` and trailing `.` into separate blocks
+    // instead of keeping the sentence together as one paragraph.
+    let mut out: Vec<String> = Vec::new();
+    let mut inline_run: Vec<NodeRef> = Vec::new();
+    for c in node.children() {
+        let is_block = c
+            .as_element()
+            .map(|el| is_block_name(&el.name.local))
+            .unwrap_or(false)
+            || subtree_has_block(&c);
+        if is_block {
+            flush_inline_run(&mut inline_run, &mut out);
+            out.extend(child_to_blocks(&c, shift));
+        } else {
+            inline_run.push(c);
+        }
+    }
+    flush_inline_run(&mut inline_run, &mut out);
+    out
+}
+
+/// Serialise an accumulated run of inline sibling nodes into a single paragraph
+/// block (if it has visible content) and clear the run.
+fn flush_inline_run(run: &mut Vec<NodeRef>, out: &mut Vec<String>) {
+    if run.is_empty() {
+        return;
+    }
+    let s: String = run.iter().map(node_inline).collect();
+    let s = tidy_inline_block(&s);
+    if !s.is_empty() {
+        out.push(s);
+    }
+    run.clear();
 }
 
 fn has_block_child(n: &NodeRef) -> bool {
