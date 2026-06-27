@@ -1182,12 +1182,20 @@ fn child_to_blocks(node: &NodeRef, shift: usize) -> Vec<String> {
         "hr" => vec!["---".to_string()],
 
         "pre" => {
+            // Strip per-line trailing whitespace: source <pre> often pads every
+            // line out to a fixed column, which renders as ragged trailing space
+            // inside the fenced block. Leading whitespace (indentation) is kept.
             let text = subtree_text(node);
-            let trimmed = text.trim_end();
-            if trimmed.is_empty() {
+            let body = text
+                .lines()
+                .map(|l| l.trim_end())
+                .collect::<Vec<_>>()
+                .join("\n");
+            let body = body.trim_matches('\n');
+            if body.is_empty() {
                 return vec![];
             }
-            vec![format!("```\n{}\n```", trimmed)]
+            vec![format!("```\n{}\n```", body)]
         }
 
         "blockquote" => {
