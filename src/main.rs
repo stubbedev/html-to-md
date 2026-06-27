@@ -5,9 +5,9 @@
 //!      before parsing so Outlook bullet spans don't leak into the DOM.
 //!   2. Parse with html5ever (via kuchikiki).
 //!   3. DOM surgery: strip comments (catches <!--[if mso]> Outlook blocks),
-//!      drop namespaced/non-text/hidden elements, normalise text nodes, split
-//!      <p>/<div> at <br>, flatten layout tables, demote stat headings, collapse
-//!      flex rows, drop decorative/empty anchors.
+//!      drop namespaced/non-text/hidden elements, normalise text nodes, bubble
+//!      <br> to block level, flatten layout tables, demote stat headings,
+//!      collapse flex rows, drop decorative/empty anchors.
 //!   4. Walk the cleaned DOM with a custom serialiser → Markdown (no htmd, no
 //!      regex post-processing).
 //!   5. Hard-wrap lines, collapse blank runs.
@@ -79,7 +79,6 @@ fn main() -> Result<(), Box<dyn Error>> {
     // Must run before drop_empty_anchors so anchors padded with ZWSPs etc.
     // become text-empty.
     normalise_text_nodes(&doc);
-    split_paragraphs_at_brs(&doc);
     flatten_link_text(&doc);
     unwrap_punctuation_emphasis(&doc);
     demote_stat_headings(&doc);
@@ -462,134 +461,6 @@ fn flatten_link_text(root: &NodeRef) {
     }
 }
 
-/// For `<br>` inside a `<p>`, bubble the `<br>` up to be a direct child of the
-/// `<p>`, then split the `<p>` into two at that point. This preserves intended
-/// line breaks (forwarded email headers, address blocks) instead of letting
-/// reflow logic join everything back into one line. `<br>` anywhere else
-/// becomes a literal `\n` text node as before.
-fn split_paragraphs_at_brs(root: &NodeRef) {
-    let brs: Vec<NodeRef> = root
-        .inclusive_descendants()
-        .filter(|n| local_name_is(n, "br"))
-        .collect();
-    for br in brs {
-        if br.parent().is_none() {
-            continue;
-        }
-        let block = match nearest_block_ancestor(&br) {
-            Some(b) => b,
-            None => {
-                br.insert_before(NodeRef::new_text("\n"));
-                br.detach();
-                continue;
-            }
-        };
-        // Split <p> and <div>; both are block containers where <br> represents
-        // an intentional line break. Skip <td>, <li>, etc. and skip when an
-        // <a> sits in the path (splitting would move children outside the link).
-        let splittable = local_name_is(&block, "p") || local_name_is(&block, "div");
-        if !splittable || has_anchor_ancestor_before_block(&br, &block) {
-            br.insert_before(NodeRef::new_text("\n"));
-            br.detach();
-            continue;
-        }
-        let p = block;
-        // Bubble <br> up to be a direct child of <p>, one level at a time.
-        while br.parent().is_some() && br.parent().as_ref() != Some(&p) {
-            let parent = br.parent().unwrap();
-            let after = collect_following_siblings(&br);
-            br.detach();
-            insert_after(&parent, br.clone());
-            let mut prev = br.clone();
-            for s in after {
-                s.detach();
-                insert_after(&prev, s.clone());
-                prev = s;
-            }
-        }
-        // Split <p> at <br>: move everything after <br> into a fresh <p>.
-        let after = collect_following_siblings(&br);
-        if !after.is_empty() {
-            let new_p = make_paragraph();
-            for s in after {
-                s.detach();
-                new_p.append(s);
-            }
-            insert_after(&p, new_p);
-        }
-        br.detach();
-    }
-}
-
-fn nearest_block_ancestor(n: &NodeRef) -> Option<NodeRef> {
-    let mut p = n.parent();
-    while let Some(parent) = p {
-        if parent
-            .as_element()
-            .map(|el| {
-                matches!(
-                    &*el.name.local,
-                    "p" | "div"
-                        | "td"
-                        | "th"
-                        | "li"
-                        | "blockquote"
-                        | "pre"
-                        | "h1"
-                        | "h2"
-                        | "h3"
-                        | "h4"
-                        | "h5"
-                        | "h6"
-                        | "table"
-                        | "tbody"
-                        | "thead"
-                        | "tfoot"
-                        | "tr"
-                        | "ul"
-                        | "ol"
-                )
-            })
-            .unwrap_or(false)
-        {
-            return Some(parent);
-        }
-        p = parent.parent();
-    }
-    None
-}
-
-fn has_anchor_ancestor_before_block(n: &NodeRef, block: &NodeRef) -> bool {
-    let mut p = n.parent();
-    while let Some(parent) = p {
-        if parent == *block {
-            return false;
-        }
-        if local_name_is(&parent, "a") {
-            return true;
-        }
-        p = parent.parent();
-    }
-    false
-}
-
-fn collect_following_siblings(n: &NodeRef) -> Vec<NodeRef> {
-    let mut v = Vec::new();
-    let mut cur = n.next_sibling();
-    while let Some(sib) = cur {
-        cur = sib.next_sibling();
-        v.push(sib);
-    }
-    v
-}
-
-fn insert_after(node: &NodeRef, new_node: NodeRef) {
-    if let Some(next) = node.next_sibling() {
-        next.insert_before(new_node);
-    } else if let Some(parent) = node.parent() {
-        parent.append(new_node);
-    }
-}
 
 fn local_name_is(n: &NodeRef, name: &str) -> bool {
     n.as_element()
@@ -799,6 +670,19 @@ fn flatten_one_table(table: &NodeRef) {
                         emitted.push(b);
                     }
                 }
+                CellMode::Paragraph(nodes) => {
+                    if let Some(p) = row_p.take() {
+                        if !subtree_text(&p).trim().is_empty() {
+                            emitted.push(p);
+                        }
+                    }
+                    let p = make_paragraph();
+                    for n in nodes {
+                        n.detach();
+                        p.append(n);
+                    }
+                    emitted.push(p);
+                }
             }
         }
         if let Some(p) = row_p {
@@ -817,6 +701,9 @@ fn flatten_one_table(table: &NodeRef) {
 enum CellMode {
     Inline(Vec<NodeRef>),
     Blocks(Vec<NodeRef>),
+    /// The cell's inline content spans multiple `<br>` lines; emit it as one
+    /// standalone multi-line paragraph (kept tight, not merged with siblings).
+    Paragraph(Vec<NodeRef>),
 }
 
 /// Re-thread whitespace-only text nodes from `kids` into `items` whenever
@@ -868,6 +755,14 @@ fn include_inline_whitespace(kids: &[NodeRef], items: &[NodeRef]) -> Vec<NodeRef
 }
 
 fn classify_cell(non_blank: &[NodeRef]) -> CellMode {
+    // A cell holding a <br> is multi-line (a benefit card `<strong>Title</strong>
+    // <br>desc`, an address block, a title+subtitle). Merging it inline with the
+    // next cell would splice that cell onto this one's tail line; emitting one
+    // block per child would scatter the lines with blank gaps. Keep it as a
+    // single tight multi-line paragraph instead.
+    if non_blank.iter().any(subtree_has_br) {
+        return CellMode::Paragraph(non_blank.to_vec());
+    }
     let all_inline = non_blank.iter().all(|k| !is_block_kid(k));
     if all_inline {
         return CellMode::Inline(non_blank.to_vec());
@@ -889,6 +784,10 @@ fn classify_cell(non_blank: &[NodeRef]) -> CellMode {
         }
     }
     CellMode::Blocks(non_blank.to_vec())
+}
+
+fn subtree_has_br(n: &NodeRef) -> bool {
+    n.inclusive_descendants().any(|d| local_name_is(&d, "br"))
 }
 
 fn is_block_kid(n: &NodeRef) -> bool {
@@ -1130,10 +1029,38 @@ fn strip_ie_conditionals(html: &str) -> String {
 /// in the document becomes `#`. Tables use visible-width column padding.
 fn to_markdown(root: &NodeRef, width: usize) -> String {
     let shift = min_heading_level(root).saturating_sub(1);
-    let blocks = doc_blocks(root, shift);
+    let blocks = drop_empty_sections(doc_blocks(root, shift));
     let md = blocks.join("\n\n");
     let md = collapse_blank_runs(&md);
     wrap_lines(&md, width)
+}
+
+/// Leading-`#` level of a block, if it is an ATX heading (`## Foo`).
+fn block_heading_level(block: &str) -> Option<usize> {
+    let h = block.trim_start();
+    let hashes = h.chars().take_while(|&c| c == '#').count();
+    if (1..=6).contains(&hashes) && h[hashes..].starts_with(' ') {
+        Some(hashes)
+    } else {
+        None
+    }
+}
+
+/// Drop headings that introduce nothing: a heading whose following block is
+/// another heading at the same or shallower level (e.g. an empty `## REVIEWERS`
+/// section in a Bitbucket PR sitting right before `## NEW ACTIVITY`). Headings
+/// followed by content, by a deeper sub-heading, or at end of document are kept.
+fn drop_empty_sections(blocks: Vec<String>) -> Vec<String> {
+    let levels: Vec<Option<usize>> = blocks.iter().map(|b| block_heading_level(b)).collect();
+    blocks
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| match levels[*i] {
+            None => true,
+            Some(lvl) => !matches!(levels.get(i + 1), Some(Some(next)) if *next <= lvl),
+        })
+        .map(|(_, b)| b.clone())
+        .collect()
 }
 
 /// Find the shallowest heading level with non-empty text content.
@@ -1230,7 +1157,7 @@ fn child_to_blocks(node: &NodeRef, shift: usize) -> Vec<String> {
             if has_block_child(node) {
                 node_blocks(node, shift)
             } else {
-                let s = children_inline(node).trim().to_string();
+                let s = tidy_inline_block(&children_inline(node));
                 if s.is_empty() {
                     vec![]
                 } else {
@@ -1244,7 +1171,8 @@ fn child_to_blocks(node: &NodeRef, shift: usize) -> Vec<String> {
                 .saturating_sub(shift)
                 .max(1)
                 .min(6);
-            let s = children_inline(node).trim().to_string();
+            // A heading is a single line; fold any `<br>`-newline to a space.
+            let s = children_inline(node).replace('\n', " ").trim().to_string();
             if s.is_empty() {
                 return vec![];
             }
@@ -1315,7 +1243,7 @@ fn child_to_blocks(node: &NodeRef, shift: usize) -> Vec<String> {
             if subtree_has_block(node) {
                 node_blocks(node, shift)
             } else {
-                let s = node_inline(node).trim().to_string();
+                let s = tidy_inline_block(&node_inline(node));
                 if s.is_empty() {
                     vec![]
                 } else {
@@ -1338,7 +1266,10 @@ fn node_inline(node: &NodeRef) -> String {
     };
     match &*el.name.local {
         "a" => {
-            let inner = children_inline(node).trim().to_string();
+            // A link is a single line; fold any `<br>`-newline in the text to a
+            // space so `[multi\nline](url)` doesn't break the link syntax.
+            let inner = children_inline(node).replace('\n', " ");
+            let inner = inner.split_whitespace().collect::<Vec<_>>().join(" ");
             if inner.is_empty() || is_decorative_glyph(&inner) {
                 return String::new();
             }
@@ -1349,6 +1280,14 @@ fn node_inline(node: &NodeRef) -> String {
                 .map(str::to_owned)
                 .unwrap_or_default();
             if href.is_empty() {
+                return inner;
+            }
+            // Garbage href: broken templates sometimes stuff text or markup
+            // into the attribute (e.g. href="Legaldesk.dk<br>Njalsgade 21F..").
+            // A real URL has no whitespace or angle brackets — drop the link
+            // syntax and keep the visible text rather than emit a broken
+            // [text](url with <br> and spaces).
+            if href.contains(|c: char| c.is_whitespace() || c == '<' || c == '>') {
                 return inner;
             }
             // [url](url) → bare url
@@ -1380,14 +1319,46 @@ fn node_inline(node: &NodeRef) -> String {
             }
             format!("`{}`", s)
         }
-        // Remaining <br> after DOM surgery: collapse to space in inline context.
-        "br" => " ".to_string(),
+        // `<br>` is an intentional line break — emit a real newline so
+        // signatures, address blocks and log dumps stay tight (consecutive
+        // lines) instead of reflowing onto one line or exploding into
+        // blank-line-separated paragraphs. Two in a row become `\n\n` (a blank
+        // line), matching the source's intent. Contexts where a raw newline is
+        // harmful sanitise it: `emphasis`/links split or fold it so markers
+        // never span lines; table cells, headings and list items flatten it.
+        "br" => "\n".to_string(),
         _ => children_inline(node),
     }
 }
 
+/// Trim a multi-line inline block (a paragraph whose `<br>`s became newlines):
+/// strip surrounding whitespace on every line so leading spaces from source
+/// text nodes (`...<br>\n  Diff: ...`) don't survive as ragged indentation,
+/// while preserving blank lines (from `<br><br>`) between the kept lines.
+fn tidy_inline_block(s: &str) -> String {
+    if !s.contains('\n') {
+        return s.trim().to_string();
+    }
+    s.lines()
+        .map(|l| l.trim())
+        .collect::<Vec<_>>()
+        .join("\n")
+        .trim()
+        .to_string()
+}
+
 fn children_inline(node: &NodeRef) -> String {
-    node.children().map(|c| node_inline(&c)).collect()
+    let s: String = node.children().map(|c| node_inline(&c)).collect();
+    // Adjacent same-marker emphasis with no separating whitespace — e.g.
+    // `<b>So, w</b><b>atch this</b>` splitting a word mid-token — concatenates
+    // to `**So, w****atch this**`. The empty `****` is noise (escaped literal
+    // asterisks are `\*`, so bare `****` only ever comes from marker adjacency);
+    // dropping it merges the runs into `**So, watch this**`.
+    if s.contains("****") {
+        s.replace("****", "")
+    } else {
+        s
+    }
 }
 
 /// Wrap inline content in an emphasis marker (`**` or `*`), keeping any leading
@@ -1397,6 +1368,23 @@ fn children_inline(node: &NodeRef) -> String {
 /// away would fuse the words (`**Twenty****minutes**`).
 fn emphasis(node: &NodeRef, marker: &str) -> String {
     let inner = children_inline(node);
+    // A `<br>` inside the emphasis (`<b>line1<br>line2</b>`) leaves a newline in
+    // `inner`; wrap each line on its own so the markers never span a line break
+    // (`**line1**\n**line2**`), which would otherwise render the literal `**`.
+    if inner.contains('\n') {
+        return inner
+            .split('\n')
+            .map(|line| {
+                let s = line.trim();
+                if s.is_empty() {
+                    String::new()
+                } else {
+                    format!("{marker}{s}{marker}")
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+    }
     let s = inner.trim();
     if s.is_empty() {
         return String::new();
@@ -1470,7 +1458,13 @@ fn serialize_list(list: &NodeRef, ordered: bool, depth: usize, shift: usize) -> 
             }
         }
 
-        let item_text = inline_parts.join("").trim().to_string();
+        // A list item is one logical line; fold any `<br>`-newline to a space so
+        // a continuation doesn't escape the bullet's indentation.
+        let item_text = inline_parts
+            .join("")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
         if item_text.is_empty() && sub_lists.is_empty() {
             continue;
         }
@@ -1502,7 +1496,10 @@ fn serialize_table(table: &NodeRef) -> String {
         .map(|tr| {
             tr.children()
                 .filter(|n| local_name_is(n, "td") || local_name_is(n, "th"))
-                .map(|cell| children_inline(&cell).trim().to_string())
+                // A `<br>`-newline inside a cell would break the table row;
+                // collapse all whitespace runs (incl. those newlines) to single
+                // spaces. Links never contain spaces, so this can't split one.
+                .map(|cell| children_inline(&cell).split_whitespace().collect::<Vec<_>>().join(" "))
                 .collect()
         })
         .collect();
