@@ -13,7 +13,7 @@
 
         html-to-md = pkgs.rustPlatform.buildRustPackage {
           pname = "html-to-md";
-          version = "0.1.0";
+          version = "0.1.1";
           src = ./.;
           # `cargoLock.lockFile` reads Cargo.lock directly and derives the
           # per-crate hashes from it. Every dependency is a crates.io registry
