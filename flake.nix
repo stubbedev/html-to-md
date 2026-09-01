@@ -1,5 +1,5 @@
 {
-  description = "html-to-md — HTML-email-to-Markdown filter for aerc (Rust)";
+  description = "html-to-md — aerc email→Markdown filters (html/plain/calendar) in one Rust binary";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
@@ -21,9 +21,11 @@
           # it can never drift out of sync, and `just sync-flake` only has to
           # keep the version string aligned with Cargo.toml.
           cargoLock.lockFile = ./Cargo.lock;
-          # `buildRustPackage` runs `cargo test` in the checkPhase by default,
-          # exercising the decoder unit test in the sandbox.
+          # `buildRustPackage` runs the test suite in the checkPhase by
+          # default; `useNextest` swaps cargoCheckHook for cargoNextestHook so
+          # the sandbox runs the same runner as `just test`.
           doCheck = true;
+          useNextest = true;
 
           meta = with pkgs.lib; {
             description = "Filter that converts vendor-noisy HTML email into clean Markdown for terminal viewing";
@@ -51,6 +53,7 @@
         devShells.default = pkgs.mkShell {
           packages = with pkgs; [
             cargo
+            cargo-nextest
             rustc
             rust-analyzer
             rustfmt

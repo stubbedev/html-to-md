@@ -25,8 +25,11 @@ jobs:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
       - run: cargo build --release --locked
-      - run: cargo test --locked
+      - run: cargo nextest run --locked
 
   lint:
     name: rustfmt + clippy

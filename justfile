@@ -5,9 +5,13 @@ _default:
 build:
     cargo build --release
 
-# Run tests.
+# Run tests (cargo-nextest).
 test:
-    cargo test
+    cargo nextest run
+
+# Re-run tests on every change.
+test-watch:
+    cargo nextest watch
 
 # Auto-fix formatting, then the full clippy gate (warnings = errors).
 lint: fmt
@@ -22,13 +26,71 @@ lint-check:
     set -euo pipefail
     cargo fmt --check
     cargo clippy --all-targets -- -D warnings
-    cargo test
+    cargo nextest run
 
 nix-check:
     nix flake check --print-build-logs
 
 # Everything CI runs, with auto-fix where possible.
 check: lint test sync-flake
+
+# Render an HTML sample through the debug build: `just try sample.html`,
+# or pipe stdin with `curl … | just try`. Auto-detects the input format.
+try file="-":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [ "{{file}}" = "-" ]; then
+        cargo run --quiet
+    else
+        cargo run --quiet < "{{file}}"
+    fi
+
+# Render the text/html part of recent messages matching a notmuch query.
+# Reads the local index and prints converted markdown per message; an
+# eyeball harness for output regressions. Nothing is written or committed.
+try-mail query="tag:inbox" count="5":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    ids=$(notmuch search --output=messages "{{query}}" | head -n "{{count}}")
+    if [ -z "$ids" ]; then
+        echo "try-mail: no messages match '{{query}}'" >&2
+        exit 1
+    fi
+    while IFS= read -r id; do
+        subject=$(notmuch show --format=json "$id" \
+            | jq -r '.[0][0][0].headers.Subject' 2>/dev/null || true)
+        part=$(notmuch show --format=json --body=true "$id" \
+            | jq -r '[.. | objects | select(."content-type"? == "text/html") | .id] | .[0]' 2>/dev/null || true)
+        echo
+        echo "════ ${subject:-<no subject>} ($id)"
+        if [ -n "$part" ] && [ "$part" != "null" ]; then
+            notmuch show --part="$part" --format=raw "$id" | cargo run --quiet
+        else
+            echo "(no text/html part)"
+        fi
+    done <<< "$ids"
+
+# Render an iCalendar sample through the ics-to-md debug build.
+try-ics file="-":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [ "{{file}}" = "-" ]; then
+        cargo run --quiet -- --calendar
+    else
+        cargo run --quiet -- --calendar < "{{file}}"
+    fi
+
+# Render a text sample through the text-plain debug build as if it were a
+# format=flowed part (AERC_FORMAT=flowed); pass AERC_FORMAT= to test passthrough.
+try-plain file="-":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    AERC_FORMAT="${AERC_FORMAT:-flowed}" cargo run --quiet -- --plain \
+        < <(if [ "{{file}}" = "-" ]; then cat; else cat "{{file}}"; fi)
+
+# Enter the flake development shell.
+dev:
+    nix develop
 
 # Keep flake.nix's version aligned with Cargo.toml. Unlike a Go module there is
 # no vendor/cargo hash to chase — `cargoLock.lockFile` reads Cargo.lock — so
