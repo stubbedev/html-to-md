@@ -44,6 +44,8 @@ jobs:
           cache-dependency-path: go/go.sum
       - uses: golangci/golangci-lint-action@v9
         with:
+          # The Go module lives in go/.
+          working-directory: go
           # Match the pinned local tool version.
           version: v2.13
           install-mode: golangci-lint
