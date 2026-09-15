@@ -3,46 +3,60 @@ _default:
 
 # Build the release binary.
 build:
-    cargo build --release
+    go -C go build -trimpath -o bin/html-to-md ./cmd/html-to-md
 
-# Run tests (cargo-nextest).
+# Run tests.
 test:
-    cargo nextest run
+    go -C go test ./...
 
-# Re-run tests on every change.
+# Re-run tests on every change (requires entr).
 test-watch:
-    cargo nextest watch
+    find go -name '*.go' | entr -s 'go -C go test ./...'
 
-# Auto-fix formatting, then the full clippy gate (warnings = errors).
+# Auto-fix formatting, then golangci-lint.
 lint: fmt
-    cargo clippy --all-targets -- -D warnings
+    cd go && golangci-lint run --fix
+
+# Read-only golangci-lint (what CI runs).
+lint-ci:
+    cd go && golangci-lint run
 
 fmt:
-    cargo fmt
+    cd go && golangci-lint fmt
 
-# Strict read-only check — same logic CI runs.
-lint-check:
+# Keep flake.nix's version aligned with the source's version string. Pass a
+# `version` to rewrite flake.nix (release use).
+sync-flake version="":
     #!/usr/bin/env bash
     set -euo pipefail
-    cargo fmt --check
-    cargo clippy --all-targets -- -D warnings
-    cargo nextest run
+    ARG="{{version}}"
+    SRC_VERSION=$(awk -F'"' '/^  version = "/ {print $2; exit}' flake.nix)
+
+    if [ -n "$ARG" ]; then
+        NEW="${ARG#v}"
+        if [ "$NEW" != "$SRC_VERSION" ]; then
+            sed -i -E "s/^  version = \"[^\"]*\";/  version = \"$NEW\";/" flake.nix
+            SRC_VERSION="$NEW"
+            echo "sync-flake: version -> $NEW"
+        fi
+    fi
+    echo "sync-flake: up-to-date (version=$SRC_VERSION)"
 
 nix-check:
     nix flake check --print-build-logs
 
 # Everything CI runs, with auto-fix where possible.
-check: lint test sync-flake
+check: lint lint-ci test
 
-# Render an HTML sample through the debug build: `just try sample.html`,
+# Render an HTML sample through a fresh build: `just try sample.html`,
 # or pipe stdin with `curl … | just try`. Auto-detects the input format.
 try file="-":
     #!/usr/bin/env bash
     set -euo pipefail
     if [ "{{file}}" = "-" ]; then
-        cargo run --quiet
+        go -C go run ./cmd/html-to-md
     else
-        cargo run --quiet < "{{file}}"
+        go -C go run ./cmd/html-to-md < "{{file}}"
     fi
 
 # Render the text/html part of recent messages matching a notmuch query.
@@ -64,62 +78,33 @@ try-mail query="tag:inbox" count="5":
         echo
         echo "════ ${subject:-<no subject>} ($id)"
         if [ -n "$part" ] && [ "$part" != "null" ]; then
-            notmuch show --part="$part" --format=raw "$id" | cargo run --quiet
+            notmuch show --part="$part" --format=raw "$id" | go -C go run ./cmd/html-to-md
         else
             echo "(no text/html part)"
         fi
     done <<< "$ids"
 
-# Render an iCalendar sample through the ics-to-md debug build.
+# Render an iCalendar sample through the calendar pipeline.
 try-ics file="-":
     #!/usr/bin/env bash
     set -euo pipefail
     if [ "{{file}}" = "-" ]; then
-        cargo run --quiet -- --calendar
+        go -C go run ./cmd/html-to-md --calendar
     else
-        cargo run --quiet -- --calendar < "{{file}}"
+        go -C go run ./cmd/html-to-md --calendar < "{{file}}"
     fi
 
-# Render a text sample through the text-plain debug build as if it were a
-# format=flowed part (AERC_FORMAT=flowed); pass AERC_FORMAT= to test passthrough.
+# Render a text sample as if it were a format=flowed part
+# (AERC_FORMAT=flowed); pass AERC_FORMAT= to test passthrough.
 try-plain file="-":
     #!/usr/bin/env bash
     set -euo pipefail
-    AERC_FORMAT="${AERC_FORMAT:-flowed}" cargo run --quiet -- --plain \
+    AERC_FORMAT="${AERC_FORMAT:-flowed}" go -C go run ./cmd/html-to-md --plain \
         < <(if [ "{{file}}" = "-" ]; then cat; else cat "{{file}}"; fi)
 
 # Enter the flake development shell.
 dev:
     nix develop
-
-# Keep flake.nix's version aligned with Cargo.toml. Unlike a Go module there is
-# no vendor/cargo hash to chase — `cargoLock.lockFile` reads Cargo.lock — so
-# this only syncs the version string. Pass a `version` to rewrite Cargo.toml,
-# Cargo.lock and flake.nix (release use).
-sync-flake version="":
-    #!/usr/bin/env bash
-    set -euo pipefail
-    ARG="{{version}}"
-    CARGO_VERSION=$(awk -F'"' '/^version = "/ {print $2; exit}' Cargo.toml)
-
-    if [ -n "$ARG" ]; then
-        NEW="${ARG#v}"
-        if [ "$NEW" != "$CARGO_VERSION" ]; then
-            sed -i -E '0,/^version = "[^"]*"/s//version = "'"$NEW"'"/' Cargo.toml
-            # Refresh the html-to-md entry in Cargo.lock to the new version.
-            cargo update --workspace --quiet 2>/dev/null || cargo generate-lockfile
-            CARGO_VERSION="$NEW"
-            echo "sync-flake: Cargo.toml version -> $NEW"
-        fi
-    fi
-
-    FLAKE_VERSION=$(awk -F'"' '/^[[:space:]]*version = "/ {print $2; exit}' flake.nix)
-    if [ "$FLAKE_VERSION" != "$CARGO_VERSION" ]; then
-        sed -i -E '0,/(version = )"[^"]*";/s//\1"'"$CARGO_VERSION"'";/' flake.nix
-        echo "sync-flake: flake.nix version -> $CARGO_VERSION"
-    else
-        echo "sync-flake: up-to-date (version=$CARGO_VERSION)"
-    fi
 
 # ─────────────────────────── Release ───────────────────────────
 
@@ -173,8 +158,8 @@ _release bump:
         *) echo "unknown bump kind: {{bump}}"; exit 1 ;;
     esac
     just sync-flake "${NEW}"
-    if [ -n "$(git status --porcelain Cargo.toml Cargo.lock flake.nix)" ]; then
-        git add Cargo.toml Cargo.lock flake.nix
+    if [ -n "$(git status --porcelain flake.nix)" ]; then
+        git add flake.nix
         git commit -m "chore: bump to v${NEW}"
     fi
     git tag -a "v${NEW}" -m "v${NEW}"

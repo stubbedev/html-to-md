@@ -13,25 +13,25 @@ calendar, HTML markers in the first 2 KB → html, else plain):
 ## HOW IT WORKS
 
 ```
-stdin HTML ─▶ pre-process ─▶ html5ever ─▶ clean ─▶ lower ─▶ transform ─▶ render ─▶ stdout
+stdin HTML ─▶ pre-process ─▶ `x/net/html` ─▶ clean ─▶ lower ─▶ transform ─▶ render ─▶ stdout
 ```
 
 1. **Pre-process** — strip non-comment IE conditionals (`<![if …]>…<![endif]>`,
    an Outlook/Word-ism) before parsing.
-2. **Parse** — html5ever via kuchikiki (spec-compliant HTML5 parsing).
-3. **Clean** (`src/clean.rs`, `src/table.rs`) — DOM surgery passes: strip
+2. **Parse** — `golang.org/x/net/html` (spec-compliant HTML5 parsing).
+3. **Clean** (`go/internal/clean`, `go/internal/table`) — DOM surgery passes: strip
    comments (catches `<!--[if mso]>` Outlook blocks), drop namespaced/hidden/
    non-text elements, normalise invisible characters, flatten CSS-flex rows
    and layout tables, demote stat-only headings, drop decorative/empty
-   anchors. The pass order in `clean_doc` is load-bearing; each pass is
+   anchors. The pass order in `clean.Doc` is load-bearing; each pass is
    documented at its definition.
-4. **Lower** (`src/lower.rs`) — the cleaned DOM becomes a typed Markdown AST
-   (`src/ast.rs`: `Block`/`Inline`). Every heuristic the old string pipeline
+4. **Lower** (`go/internal/lower`) — the cleaned DOM becomes a typed Markdown AST
+   (`go/internal/ast`: `Block`/`Inline`). Every heuristic the old string pipeline
    re-parsed with regexes (heading levels, link-only blocks, visible widths)
    is expressed on typed nodes instead.
-5. **Transform** (`src/ast.rs`) — heading remap and rank-compression,
+5. **Transform** (`go/internal/ast`) — heading remap and rank-compression,
    empty-section dropping, short-link-row joining, table column pruning.
-6. **Render** (`src/render.rs`) — one deterministic pass: escape source text
+6. **Render** (`go/internal/render`) — one deterministic pass: escape source text
    once, emit structural markers, pad pipe-table columns from typed widths.
 
 Exactly one regex survives: the pre-parse IE-conditional strip — the only
@@ -116,18 +116,18 @@ it, tight lines otherwise (Google's decorative fence is stripped).
 ## DEVELOPMENT
 
 ```sh
-just test        # cargo-nextest
+just test        # go test ./...
 just test-watch  # re-run on every change
-just lint-check  # fmt --check + clippy -D warnings + nextest (what CI runs)
+just lint-ci     # golangci-lint (what CI runs)
 just try f.html  # render an HTML sample through the debug build
 just try-mail 'tag:inbox' 5   # render the text/html part of recent mail
 just try-ics f.ics            # render an iCalendar sample
 just try-plain f.txt          # render a text sample as format=flowed
-just nix-check   # nix flake check (the sandbox check phase runs nextest too)
+just nix-check   # nix flake check (the sandbox check phase runs go test too)
 just dev         # enter the flake dev shell
 ```
 
-Behaviour is locked by golden tests (`tests/pipeline.rs`): each case pairs a
+Behaviour is locked by golden tests (`go/tests/golden`): each case pairs a
 vendor-shaped HTML snippet (Outlook conditionals, Bitbucket PR notices,
 Mailchimp newsletters, Sentry digests, …) with its exact expected Markdown.
 New heuristics land together with a case.

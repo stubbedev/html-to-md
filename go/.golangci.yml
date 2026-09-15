@@ -1,0 +1,20 @@
+version: "2"
+
+run:
+  modules-download-mode: vendor
+
+formatters:
+  enable:
+    - gofmt
+
+linters:
+  enable:
+    - errcheck
+    - govet
+    - ineffassign
+    - staticcheck
+    - misspell
+    - unparam
+    - unused
+    - modernize
+    - gosec

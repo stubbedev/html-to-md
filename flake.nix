@@ -1,5 +1,5 @@
 {
-  description = "html-to-md — aerc email→Markdown filters (html/plain/calendar) in one Rust binary";
+  description = "html-to-md — aerc email→Markdown filters (html/plain/calendar) in one Go binary";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
@@ -11,21 +11,22 @@
       let
         pkgs = import nixpkgs { inherit system; };
 
-        html-to-md = pkgs.rustPlatform.buildRustPackage {
+        goRolling = pkgs.go_latest;
+
+        goBuilder = pkgs.buildGoModule.override { go = goRolling; };
+
+        html-to-md = goBuilder {
           pname = "html-to-md";
           version = "0.1.1";
-          src = ./.;
-          # `cargoLock.lockFile` reads Cargo.lock directly and derives the
-          # per-crate hashes from it. Every dependency is a crates.io registry
-          # package, so there is NO separate cargoHash/vendorHash to maintain —
-          # it can never drift out of sync, and `just sync-flake` only has to
-          # keep the version string aligned with Cargo.toml.
-          cargoLock.lockFile = ./Cargo.lock;
-          # `buildRustPackage` runs the test suite in the checkPhase by
-          # default; `useNextest` swaps cargoCheckHook for cargoNextestHook so
-          # the sandbox runs the same runner as `just test`.
+          src = ./go;
+          # Build with the same rolling toolchain as the dev shell so the
+          # package and local development never disagree on language version.
+          # Dependencies (x/net/html + go-runewidth) are vendored into
+          # `go/vendor`, so there is no vendorHash to maintain and the sandbox
+          # never needs a module proxy.
+          vendorHash = null;
+          # The check phase runs `go test ./...`.
           doCheck = true;
-          useNextest = true;
 
           meta = with pkgs.lib; {
             description = "Filter that converts vendor-noisy HTML email into clean Markdown for terminal viewing";
@@ -52,12 +53,12 @@
 
         devShells.default = pkgs.mkShell {
           packages = with pkgs; [
-            cargo
-            cargo-nextest
-            rustc
-            rust-analyzer
-            rustfmt
-            clippy
+            # Rolling Go channel: build, tests and lint all use the same
+            # newest toolchain as the package above.
+            goRolling
+            gotools
+            gopls
+            golangci-lint
             just
             git
           ];

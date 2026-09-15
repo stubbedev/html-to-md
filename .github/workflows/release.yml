@@ -9,7 +9,7 @@ permissions:
   contents: write
 
 env:
-  CARGO_TERM_COLOR: always
+  GOFLAGS: -trimpath
 
 jobs:
   build:
@@ -20,40 +20,36 @@ jobs:
       matrix:
         include:
           - name: linux-amd64
-            target: x86_64-unknown-linux-musl
             os: ubuntu-latest
-            cross: true
+            goos: linux
+            goarch: amd64
           - name: linux-arm64
-            target: aarch64-unknown-linux-musl
             os: ubuntu-latest
-            cross: true
+            goos: linux
+            goarch: arm64
           - name: darwin-amd64
-            target: x86_64-apple-darwin
             os: macos-latest
-            cross: false
+            goos: darwin
+            goarch: amd64
           - name: darwin-arm64
-            target: aarch64-apple-darwin
             os: macos-latest
-            cross: false
+            goos: darwin
+            goarch: arm64
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-go@v7
         with:
-          targets: ${{ matrix.target }}
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: ${{ matrix.target }}
+          go-version-file: go/go.mod
+          cache-dependency-path: go/go.sum
 
       - name: Build
         shell: bash
-        run: |
-          set -euo pipefail
-          if [ "${{ matrix.cross }}" = "true" ]; then
-            cargo install cross --locked
-            cross build --release --locked --target ${{ matrix.target }}
-          else
-            cargo build --release --locked --target ${{ matrix.target }}
-          fi
+        working-directory: go
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: "0"
+        run: go build -trimpath -ldflags="-s -w" -o ../dist/html-to-md ./cmd/html-to-md
 
       - name: Package
         shell: bash
@@ -62,8 +58,9 @@ jobs:
           VERSION="${GITHUB_REF_NAME#v}"
           STAGE="html-to-md-${VERSION}-${{ matrix.name }}"
           mkdir -p "dist/$STAGE"
-          cp "target/${{ matrix.target }}/release/html-to-md" "dist/$STAGE/"
+          cp dist/html-to-md "dist/$STAGE/"
           cp README.md LICENSE "dist/$STAGE/" 2>/dev/null || true
+          rm dist/html-to-md
           cd dist
           tar -czf "${STAGE}.tar.gz" "$STAGE"
           shasum -a 256 "${STAGE}.tar.gz" > "${STAGE}.tar.gz.sha256"

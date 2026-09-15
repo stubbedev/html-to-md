@@ -11,37 +11,43 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  CARGO_TERM_COLOR: always
+  GOFLAGS: -trimpath
 
 jobs:
   build-test:
-    name: cargo build + test (${{ matrix.os }})
+    name: go build + test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest]
+    defaults:
+      run:
+        working-directory: go
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - uses: taiki-e/install-action@v2
+      - uses: actions/setup-go@v6
         with:
-          tool: cargo-nextest
-      - run: cargo build --release --locked
-      - run: cargo nextest run --locked
+          go-version-file: go/go.mod
+          cache-dependency-path: go/go.sum
+      - run: go build ./...
+      - run: go test ./...
 
   lint:
-    name: rustfmt + clippy
+    name: golangci-lint
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-go@v7
         with:
-          components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo fmt --check
-      - run: cargo clippy --all-targets --locked -- -D warnings
+          go-version-file: go/go.mod
+          cache-dependency-path: go/go.sum
+      - uses: golangci/golangci-lint-action@v9
+        with:
+          # Match the pinned local tool version.
+          version: v2.13
+          install-mode: golangci-lint
+          args: --issues-exit-code=1 --timeout 5m
 
   nix:
     name: nix flake check
@@ -59,7 +65,7 @@ jobs:
             extra-trusted-public-keys = default:6uWvXutL9cXjV3lii+Ur5ff+ArQoG4kMBKNXWrIxhHg=
       - uses: nix-community/cache-nix-action@v7
         with:
-          primary-key: nix-${{ runner.os }}-${{ hashFiles('**/flake.lock', '**/Cargo.lock', '**/go.sum') }}
+          primary-key: nix-${{ runner.os }}-${{ hashFiles('**/flake.lock', '**/go.sum') }}
           restore-prefixes-first-match: nix-${{ runner.os }}-
           purge: true
           purge-prefixes: nix-${{ runner.os }}-
