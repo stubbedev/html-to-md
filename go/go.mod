@@ -1,8 +1,8 @@
-module github.com/stubbe/html-to-md
+module github.com/stubbedev/html-to-md/go
 
 go 1.27
 
-toolchain go1.27.1
+toolchain go1.27.2
 
 require (
 	github.com/mattn/go-runewidth v0.0.30
