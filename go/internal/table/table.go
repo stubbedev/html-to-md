@@ -8,7 +8,7 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/stubbe/html-to-md/internal/dom"
+	"github.com/stubbedev/html-to-md/go/internal/dom"
 )
 
 // Flatten rewrites layout tables into paragraphs in place. Tables are

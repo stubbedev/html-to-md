@@ -1,7 +1,7 @@
 package calendar
 
 import (
-	conv "github.com/stubbe/html-to-md/internal/convert"
+	conv "github.com/stubbedev/html-to-md/go/internal/convert"
 	"strings"
 )
 

@@ -3,9 +3,9 @@ package lower
 import (
 	"strings"
 
-	"github.com/stubbe/html-to-md/internal/ast"
-	"github.com/stubbe/html-to-md/internal/dom"
-	"github.com/stubbe/html-to-md/internal/render"
+	"github.com/stubbedev/html-to-md/go/internal/ast"
+	"github.com/stubbedev/html-to-md/go/internal/dom"
+	"github.com/stubbedev/html-to-md/go/internal/render"
 )
 
 // list lowers a <ul>/<ol>: collect inline text and nested sub-lists from

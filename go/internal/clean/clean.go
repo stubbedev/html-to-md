@@ -8,9 +8,9 @@ import (
 	"strings"
 	"unicode"
 
-	"github.com/stubbe/html-to-md/internal/dom"
-	"github.com/stubbe/html-to-md/internal/table"
-	"github.com/stubbe/html-to-md/internal/text"
+	"github.com/stubbedev/html-to-md/go/internal/dom"
+	"github.com/stubbedev/html-to-md/go/internal/table"
+	"github.com/stubbedev/html-to-md/go/internal/text"
 )
 
 // Doc runs steps 1-3 of the pipeline: strip IE conditionals, parse, run

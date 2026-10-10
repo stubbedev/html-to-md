@@ -9,9 +9,9 @@ import (
 	"os"
 	"strings"
 
-	"github.com/stubbe/html-to-md/internal/calendar"
-	"github.com/stubbe/html-to-md/internal/convert"
-	"github.com/stubbe/html-to-md/internal/plain"
+	"github.com/stubbedev/html-to-md/go/internal/calendar"
+	"github.com/stubbedev/html-to-md/go/internal/convert"
+	"github.com/stubbedev/html-to-md/go/internal/plain"
 )
 
 const usage = `html-to-md — render email parts as Markdown

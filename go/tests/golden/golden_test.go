@@ -8,7 +8,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/stubbe/html-to-md/internal/convert"
+	"github.com/stubbedev/html-to-md/go/internal/convert"
 )
 
 var golden = []struct {

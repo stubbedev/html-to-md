@@ -5,10 +5,10 @@ package convert
 import (
 	"strings"
 
-	"github.com/stubbe/html-to-md/internal/ast"
-	"github.com/stubbe/html-to-md/internal/clean"
-	"github.com/stubbe/html-to-md/internal/lower"
-	"github.com/stubbe/html-to-md/internal/render"
+	"github.com/stubbedev/html-to-md/go/internal/ast"
+	"github.com/stubbedev/html-to-md/go/internal/clean"
+	"github.com/stubbedev/html-to-md/go/internal/lower"
+	"github.com/stubbedev/html-to-md/go/internal/render"
 )
 
 // Format is a conversion mode: selected by the binary's flags, or sniffed

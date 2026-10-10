@@ -6,8 +6,8 @@ import (
 	"unicode"
 	"unicode/utf8"
 
-	"github.com/stubbe/html-to-md/internal/dom"
-	"github.com/stubbe/html-to-md/internal/text"
+	"github.com/stubbedev/html-to-md/go/internal/dom"
+	"github.com/stubbedev/html-to-md/go/internal/text"
 )
 
 // FlattenOne rewrites a single layout table into paragraphs, inserted right

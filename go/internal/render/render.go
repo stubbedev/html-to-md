@@ -6,7 +6,7 @@ package render
 import (
 	"strings"
 
-	"github.com/stubbe/html-to-md/internal/ast"
+	"github.com/stubbedev/html-to-md/go/internal/ast"
 )
 
 // Document renders a whole document: blocks joined by blank lines, blank

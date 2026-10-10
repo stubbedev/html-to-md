@@ -3,7 +3,7 @@
 package ast
 
 import (
-	"github.com/stubbe/html-to-md/internal/text"
+	"github.com/stubbedev/html-to-md/go/internal/text"
 )
 
 type Table = [][][]Inline // rows of cells of inlines

@@ -4,10 +4,10 @@ import (
 	"strings"
 	"unicode"
 
-	"github.com/stubbe/html-to-md/internal/ast"
-	"github.com/stubbe/html-to-md/internal/dom"
-	"github.com/stubbe/html-to-md/internal/render"
-	"github.com/stubbe/html-to-md/internal/text"
+	"github.com/stubbedev/html-to-md/go/internal/ast"
+	"github.com/stubbedev/html-to-md/go/internal/dom"
+	"github.com/stubbedev/html-to-md/go/internal/render"
+	"github.com/stubbedev/html-to-md/go/internal/text"
 )
 
 // inlineChildren lowers the children of one element into an inline run.
