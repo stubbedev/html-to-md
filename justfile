@@ -24,18 +24,18 @@ lint-ci:
 fmt:
     cd go && golangci-lint fmt
 
-# Keep flake.nix's version aligned with the source's version string. Pass a
-# `version` to rewrite flake.nix (release use).
+# Keep nix/package.nix's version aligned with the source's version string.
+# Pass a `version` to rewrite nix/package.nix (release use).
 sync-flake version="":
     #!/usr/bin/env bash
     set -euo pipefail
     ARG="{{version}}"
-    SRC_VERSION=$(awk -F'"' '/^  version = "/ {print $2; exit}' flake.nix)
+    SRC_VERSION=$(awk -F'"' '/^ *version = "/ {print $2; exit}' nix/package.nix)
 
     if [ -n "$ARG" ]; then
         NEW="${ARG#v}"
         if [ "$NEW" != "$SRC_VERSION" ]; then
-            sed -i -E "s/^  version = \"[^\"]*\";/  version = \"$NEW\";/" flake.nix
+            sed -i -E "s/^( *)version = \"[^\"]*\";/\1version = \"$NEW\";/" nix/package.nix
             SRC_VERSION="$NEW"
             echo "sync-flake: version -> $NEW"
         fi
@@ -158,8 +158,8 @@ _release bump:
         *) echo "unknown bump kind: {{bump}}"; exit 1 ;;
     esac
     just sync-flake "${NEW}"
-    if [ -n "$(git status --porcelain flake.nix)" ]; then
-        git add flake.nix
+    if [ -n "$(git status --porcelain nix/package.nix)" ]; then
+        git add nix/package.nix
         git commit -m "chore: bump to v${NEW}"
     fi
     git tag -a "v${NEW}" -m "v${NEW}"
