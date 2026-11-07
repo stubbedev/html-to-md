@@ -1,6 +1,5 @@
 version: 2
 updates:
-  # Keep GitHub Actions pinned to current major/patch releases.
   - package-ecosystem: github-actions
     directory: "/"
     schedule:
@@ -11,13 +10,13 @@ updates:
       actions:
         patterns: ["*"]
 
-  # Keep Rust crate dependencies current.
-  - package-ecosystem: cargo
-    directory: "/"
+  - package-ecosystem: gomod
+    directory: "/go"
+    vendor: true
     schedule:
       interval: weekly
     commit-message:
       prefix: "deps"
     groups:
-      cargo:
+      gomod:
         patterns: ["*"]
